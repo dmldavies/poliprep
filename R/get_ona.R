@@ -466,7 +466,19 @@ flatten_ona_record <- function(x, parent_key = "", sep = "/") {
   # atomic → assign to parent_key
   if (!is.list(x)) {
     if (nzchar(parent_key)) {
-      out[[parent_key]] <- as.character(x)
+      if (length(x) > 1) {
+        # Multi-element atomic vector (e.g. `_geolocation = c(lat, lon)` from
+        # a JSON array of scalars). Without this branch the whole vector is
+        # stored under a single key, and the subsequent as.data.frame() call
+        # recycles the other length-1 fields to match its length, producing
+        # one extra row per element — a silent row-duplication bug.
+        # Expand into indexed keys to mirror the unnamed-list convention.
+        for (i in seq_along(x)) {
+          out[[paste0(parent_key, "[", i, "]")]] <- as.character(x[i])
+        }
+      } else {
+        out[[parent_key]] <- as.character(x)
+      }
     }
     return(out)
   }
