@@ -290,6 +290,11 @@ process_logical_filters <- function(filters) {
 #' @param comparison_filters Optional. A named list for filtering with
 #'                comparisons. Names are column names, values are comparison
 #'                conditions. Supports >, <, >=, <=, =, != operators.
+#' @param validate Logical; if `TRUE` (the default) the function calls
+#'                `available_ona_forms()` to verify that `form_id` exists
+#'                before attempting to download. Set to `FALSE` to skip this
+#'                check when the caller has already validated the form ID,
+#'                avoiding a redundant pair of HTTP requests.
 #'
 #' @return A data frame containing the filtered data downloaded from the ONA
 #'         API, with empty columns removed.
@@ -318,7 +323,8 @@ get_ona_form <- function(base_url = "https://api.whonghub.org",
                          api_token,
                          selected_columns = NULL,
                          logical_filters = NULL,
-                         comparison_filters = NULL) {
+                         comparison_filters = NULL,
+                         validate = TRUE) {
   # Check base URL validity
   base_url <- validate_base_url(base_url)
 
@@ -331,21 +337,25 @@ get_ona_form <- function(base_url = "https://api.whonghub.org",
   )
   cat("\n")
 
-  # Check if the form id is available for download
-  resp_data <- available_ona_forms(
-    base_url = base_url,
-    api_token = api_token
-  )
-
-  if (!(form_id %in% unique(resp_data$id))) {
-    cli::cli_abort(
-      paste0(
-        "Form ID ",
-        form_id,
-        " not found. Use `available_ona_forms()` ",
-        "to check available forms for download."
-      )
+  # Check if the form id is available for download. Skipped when `validate`
+  # is FALSE, e.g. when called from `get_ona_data()` which has already
+  # validated all requested form IDs in a single call.
+  if (isTRUE(validate)) {
+    resp_data <- available_ona_forms(
+      base_url = base_url,
+      api_token = api_token
     )
+
+    if (!(form_id %in% unique(resp_data$id))) {
+      cli::cli_abort(
+        paste0(
+          "Form ID ",
+          form_id,
+          " not found. Use `available_ona_forms()` ",
+          "to check available forms for download."
+        )
+      )
+    }
   }
 
   # Initialize query parameters list
@@ -741,15 +751,21 @@ get_ona_data <- function(base_url = "https://api.whonghub.org",
   }
 
   # Fetch data sequentially for each form ID -----------------------------------
+  # The outer check above already validates all form IDs against the API in a
+  # single call, so we pass `validate = FALSE` to `get_ona_form()` to avoid
+  # a redundant `available_ona_forms()` request per form. We also forward
+  # `base_url` so non-default ONA hosts are honoured end-to-end.
   combined_data <- purrr::map_dfr(
     form_ids,
     function(form_id) {
       data <- get_ona_form(
+        base_url = base_url,
         form_id = form_id,
         api_token = api_token,
         selected_columns = selected_columns,
         logical_filters = logical_filters,
-        comparison_filters = comparison_filters
+        comparison_filters = comparison_filters,
+        validate = FALSE
       )
       dplyr::mutate(data, form_id_num = form_id)
     }

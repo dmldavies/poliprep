@@ -10,7 +10,8 @@ get_ona_form(
   api_token,
   selected_columns = NULL,
   logical_filters = NULL,
-  comparison_filters = NULL
+  comparison_filters = NULL,
+  validate = TRUE
 )
 }
 \arguments{
@@ -33,6 +34,12 @@ filter by. Uses OR within groups and AND between groups.}
 \item{comparison_filters}{Optional. A named list for filtering with
 comparisons. Names are column names, values are comparison
 conditions. Supports >, <, >=, <=, =, != operators.}
+
+\item{validate}{Logical; if \code{TRUE} (the default) the function calls
+\code{available_ona_forms()} to verify that \code{form_id} exists
+before attempting to download. Set to \code{FALSE} to skip this
+check when the caller has already validated the form ID,
+avoiding a redundant pair of HTTP requests.}
 }
 \value{
 A data frame containing the filtered data downloaded from the ONA
