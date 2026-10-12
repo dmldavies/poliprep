@@ -604,7 +604,7 @@ get_paginated_data <- function(api_url, api_token) {
     }
 
     purrr::map(page_data, flatten_ona_record) |>
-      purrr::map(as.data.frame, stringsAsFactors = FALSE) |>
+      purrr::map(\(x) tibble::as_tibble(x, .name_repair = "minimal")) |>
       dplyr::bind_rows()
   }
 
