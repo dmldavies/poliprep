@@ -465,8 +465,18 @@ flatten_ona_record <- function(x, parent_key = "", sep = "/") {
 
   # atomic → assign to parent_key
   if (!is.list(x)) {
-    if (nzchar(parent_key)) {
+    if (!nzchar(parent_key) || length(x) == 0) {
+      return(out)
+    }
+    if (length(x) == 1) {
       out[[parent_key]] <- as.character(x)
+    } else {
+      # JSON arrays of scalars (e.g. `_geolocation: [lat, lon]`) arrive as
+      # atomic vectors. Spread them across indexed columns; a length-2 value
+      # in one column would otherwise split the submission into two rows.
+      for (i in seq_along(x)) {
+        out[[paste0(parent_key, "[", i, "]")]] <- as.character(x[[i]])
+      }
     }
     return(out)
   }
@@ -509,13 +519,15 @@ flatten_ona_record <- function(x, parent_key = "", sep = "/") {
 #' @return A list containing the retrieved data parsed from JSON format. If
 #'         the specified content is not found or an error occurs, the function
 #'         stops and returns an error message.
-get_ona_page <- function(api_url, api_token, times = 3) {
+get_ona_page <- function(api_url, api_token, times = 3,
+                         show_progress = .ona_show_progress()) {
   tryCatch(
     {
       raw <- httr::RETRY(
         "GET",
         api_url,
         httr::add_headers(Authorization = paste("Token", api_token)),
+        if (show_progress) .ona_download_progress(environment()),
         times = times,
         pause_cap = 30,
         terminate_on = c(400L, 401L, 403L, 404L)
@@ -533,6 +545,72 @@ get_ona_page <- function(api_url, api_token, times = 3) {
       stop("Error encountered: ", e$message, call. = FALSE)
     }
   )
+}
+
+#' Should ONA downloads show progress bars?
+#'
+#' Progress is shown in interactive sessions by default. Turn it off with
+#' `options(poliprep.progress = FALSE)`, or force it on in scheduled
+#' `Rscript` runs with `options(poliprep.progress = TRUE)`.
+#'
+#' @return `TRUE` or `FALSE`.
+#' @keywords internal
+.ona_show_progress <- function() {
+  isTRUE(getOption("poliprep.progress", interactive()))
+}
+
+#' Build an httr config that shows a cli download bar
+#'
+#' Hooks into libcurl's progress callback and drives a `cli` progress bar
+#' with the bytes received. When the server sends a Content-Length the bar
+#' shows a percentage and ETA; ONA usually streams JSON without one, so the
+#' bar then shows the amount downloaded and the transfer rate.
+#'
+#' @param .envir The calling frame. The bar closes when that frame exits.
+#' @return An httr config object.
+#' @keywords internal
+.ona_download_progress <- function(.envir = parent.frame()) {
+  state <- new.env(parent = emptyenv())
+  state$bar <- NULL
+
+  callback <- function(down, up) {
+    total <- down[[1]]
+    now <- down[[2]]
+
+    if (now > 0) {
+      if (is.null(state$bar)) {
+        known <- total > 0
+        state$bar <- cli::cli_progress_bar(
+          name = "Downloading",
+          type = "download",
+          total = if (known) total else NA,
+          format = if (known) {
+            paste(
+              "{cli::pb_name} {cli::pb_bar} {cli::pb_percent} |",
+              "{cli::pb_current_bytes}/{cli::pb_total_bytes} |",
+              "ETA {cli::pb_eta}"
+            )
+          } else {
+            paste(
+              "{cli::pb_spin} {cli::pb_name} {cli::pb_current_bytes}",
+              "[{cli::pb_rate_bytes}] | {cli::pb_elapsed}"
+            )
+          },
+          format_done = paste(
+            "{cli::col_green(cli::symbol$tick)} Downloaded",
+            "{cli::pb_current_bytes} in {cli::pb_elapsed}"
+          ),
+          clear = FALSE,
+          .envir = .envir
+        )
+      }
+      cli::cli_progress_update(id = state$bar, set = now, .envir = .envir)
+    }
+
+    TRUE # returning anything else would abort the transfer
+  }
+
+  httr::config(noprogress = FALSE, progressfunction = callback)
 }
 
 #' Validate and Normalize a Base URL
@@ -603,9 +681,38 @@ get_paginated_data <- function(api_url, api_token) {
       return(data.frame())
     }
 
-    purrr::map(page_data, flatten_ona_record) |>
-      purrr::map(\(x) tibble::as_tibble(x, .name_repair = "minimal")) |>
-      dplyr::bind_rows()
+    # Flatten each submission into a one-row tibble. `.name_repair =
+    # "minimal"` keeps ONA's names as they are (`_id`, `group/question`);
+    # as.data.frame() would turn them into `X_id` and `group.question`.
+    rows <- purrr::map(
+      page_data,
+      function(record) {
+        tibble::as_tibble(
+          flatten_ona_record(record),
+          .name_repair = "minimal"
+        )
+      },
+      .progress = if (.ona_show_progress()) {
+        list(
+          name = "Processing records",
+          format = paste(
+            "{cli::pb_name} {cli::pb_bar} {cli::pb_current}/{cli::pb_total}",
+            "| ETA {cli::pb_eta}"
+          ),
+          clear = FALSE
+        )
+      } else {
+        FALSE
+      }
+    )
+
+    if (.ona_show_progress() && length(rows) > 5000) {
+      cli::cli_alert_info(
+        "Combining {format(length(rows), big.mark = ',')} records..."
+      )
+    }
+
+    dplyr::bind_rows(rows)
   }
 
   repeat {
@@ -625,6 +732,15 @@ get_paginated_data <- function(api_url, api_token) {
     if (nrow(current_page) < api_limit || nrow(current_page) == 0) break
 
     page_number <- page_number + 1
+
+    if (.ona_show_progress()) {
+      cli::cli_alert_info(
+        paste0(
+          "{format(nrow(results), big.mark = ',')} records so far, ",
+          "fetching page {page_number}..."
+        )
+      )
+    }
   }
 
   return(dplyr::distinct(results))
@@ -741,10 +857,17 @@ get_ona_data <- function(base_url = "https://api.whonghub.org",
   }
 
   # Fetch data sequentially for each form ID -----------------------------------
+  n_forms <- length(form_ids)
+
   combined_data <- purrr::map_dfr(
-    form_ids,
-    function(form_id) {
+    seq_along(form_ids),
+    function(i) {
+      form_id <- form_ids[[i]]
+      if (n_forms > 1 && .ona_show_progress()) {
+        cli::cli_rule(left = "Form {i} of {n_forms} ({form_id})")
+      }
       data <- get_ona_form(
+        base_url = base_url,
         form_id = form_id,
         api_token = api_token,
         selected_columns = selected_columns,
@@ -861,16 +984,20 @@ generate_urls <- function(full_data, file_path,
 #' @param urls array of url strings
 #' @return tibble with all data
 call_urls <- function(urls, api_token) {
-  progressr::handlers("cli")
+  n_urls <- length(urls)
 
-  progressr::with_progress({
-    p <- progressr::progressor(along = urls)
-
-    results <- purrr::map(
-      urls,
-      function(url) {
-        p() # Update progress
+  # Each form gets a header line followed by its own download and processing
+  # bars. (An outer progressr bar here used to tick before each download
+  # started, so it read 100% while the last form was still downloading.)
+  results <- purrr::map(
+      seq_along(urls),
+      function(i) {
+        url <- urls[[i]]
         form_id <- gsub(".*data/(\\d+).*", "\\1", url)
+
+        if (.ona_show_progress()) {
+          cli::cli_rule(left = "Form {i} of {n_urls} ({form_id})")
+        }
 
         tryCatch(
           {
@@ -896,7 +1023,6 @@ call_urls <- function(urls, api_token) {
       }
     ) |>
       dplyr::bind_rows()
-  })
 
   gc() # Clean up memory
   results
