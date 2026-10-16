@@ -40,7 +40,7 @@ Imports:
   doFuture,
   foreach,
   future,
-  purrr,
+  purrr (>= 1.0.0),
   archive,
   RODBC,
   geosphere,
