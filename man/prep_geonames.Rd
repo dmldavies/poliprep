@@ -38,13 +38,19 @@ attached to sntutils is used.}
 
 \item{level4}{level4 col name (settlement) in both 'data' and 'lookup_data'.}
 
-\item{cache_path}{Optional; the path where the cache data frame is
-saved after user modifications. Supports all file formats supported
-by sntutils read() and write() functions including .rds, .csv, .xlsx,
-.dta, .tsv, and more. This path is also used to match and integrate
-previously established corrections into the current session. If NULL
-or the file does not exist at the provided path, users will be
-prompted to specify a new path or create a new cache data frame.}
+\item{cache_path}{Optional; file holding the corrections you make in the
+interactive menu (.rds, .csv, .xlsx, ...). Every saved correction is
+applied automatically at the start of each run, before matching and
+before any questions, in interactive and non-interactive mode, and
+new corrections are added to it at the end of an interactive
+session. A correction is tied to where the name was found (e.g.
+MUNICIPAL AREA COUNCIL -> AMAC within FCT), so the same name can be
+corrected differently under different parents; if a name is
+corrected again, the newest correction wins. If NULL (the default),
+a per-user cache is used: \code{getOption("poliprep.geoname_cache")} if
+set, otherwise \code{geoname_cache.rds} in
+\code{tools::R_user_dir("poliprep", "data")}. Set the option to a shared
+file to let a team reuse each other's corrections.}
 
 \item{unmatched_export_path}{Optional; path to save unmatched data after
 processing. The file will include complete rows with full hierarchical
@@ -98,17 +104,17 @@ or even any string matching that has lookup data.
 \details{
 The function performs the following steps:
 \enumerate{
-\item Prepares the data by ensuring administrative names are in uppercase for
-consistent matching.
-\item Attempts to load a previously saved cache file if available, or
-initializes the cleaning process.
+\item Prepares the data by ensuring administrative names are in uppercase,
+with tidy spacing, for consistent matching.
+\item Applies every correction saved in the cache (see \code{cache_path}), so
+names corrected in earlier sessions are fixed before matching.
 \item Matches administrative names between \code{target_df} and \code{lookup_df} using
 string distance algorithms, running in parallel. Results are ranked
 by closeness.
 \item Engages the user through an interactive CLI menu to make decisions on
 ambiguous matches.
-\item Saves the user's decisions in a cache data frame, either to a specified
-path or by prompting the user for a location.
+\item Saves the user's decisions to the cache automatically (choose
+"Exit without saving" in the menu to discard them).
 \item Returns a cleaned data frame with updated administrative names based on
 user choices and algorithmic matching.
 }

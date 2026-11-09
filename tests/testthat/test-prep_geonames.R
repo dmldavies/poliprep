@@ -2049,3 +2049,141 @@ testthat::test_that("both features work together correctly", {
   # Clean up
   unlink(csv_path)
 })
+
+# Saved corrections (cache) -----------------------------------------------------
+
+geo_lookup <- data.frame(
+  country = "NIGERIA",
+  state = c("FCT", "FCT", "FCT", "FCT", "KANO", "NASARAWA"),
+  lga = c("AMAC", "AMAC", "BWARI", "BWARI", "NASARAWA", "NASARAWA"),
+  ward = c("GARKI", "CITY CENTRE", "KUBWA", "BWARI CENTRAL", "GAMA", "ARIKYA"),
+  stringsAsFactors = FALSE
+)
+
+geo_cache_row <- function(level, name, replacement, parents = character(),
+                          time = "2026-01-01 00:00:00 UTC") {
+  k <- as.integer(sub("level", "", level))
+  prepped <- c(parents, replacement, rep(NA, 4 - k))
+  row <- data.frame(
+    level = level, name_to_match = name, replacement = replacement,
+    created_time = time, name_of_creator = "test", stringsAsFactors = FALSE
+  )
+  for (j in 0:4) row[[paste0("level", j, "_prepped")]] <- prepped[j + 1]
+  row
+}
+
+testthat::test_that("saved corrections are applied before matching, non-interactively", {
+  cache_file <- tempfile(fileext = ".rds")
+  saveRDS(
+    geo_cache_row("level2", "MUNICIPAL AREA COUNCIL", "AMAC", c("NIGERIA", "FCT")),
+    cache_file
+  )
+  target <- data.frame(
+    country = "Nigeria", state = "FCT",
+    lga = c("Municipal Area Council", " Municipal  Area Council "),
+    ward = "Garki", stringsAsFactors = FALSE
+  )
+
+  result <- suppressMessages(prep_geonames(
+    target, lookup_df = geo_lookup,
+    level0 = "country", level1 = "state", level2 = "lga", level3 = "ward",
+    cache_path = cache_file, interactive = FALSE
+  ))
+
+  testthat::expect_equal(result$lga, c("AMAC", "AMAC"))
+  unlink(cache_file)
+})
+
+testthat::test_that("a correction only applies under its own parents", {
+  cache <- rbind(
+    geo_cache_row("level3", "CENTRAL", "CITY CENTRE", c("NIGERIA", "FCT", "AMAC")),
+    geo_cache_row("level3", "CENTRAL", "BWARI CENTRAL", c("NIGERIA", "FCT", "BWARI"))
+  )
+  df <- data.frame(
+    id = 1:3, country = "NIGERIA", state = "FCT",
+    lga = c("AMAC", "BWARI", "AMAC"), ward = c("CENTRAL", "CENTRAL", "GARKI"),
+    stringsAsFactors = FALSE
+  )
+
+  out <- .apply_geoname_cache(df, cache, c("country", "state", "lga", "ward"))
+
+  testthat::expect_equal(out$data$id, 1:3)
+  testthat::expect_equal(out$data$ward, c("CITY CENTRE", "BWARI CENTRAL", "GARKI"))
+  testthat::expect_equal(out$rows, 2)
+})
+
+testthat::test_that("parent corrections are applied before child lookups", {
+  cache <- rbind(
+    geo_cache_row("level2", "MUNICIPAL AREA COUNCIL", "AMAC", c("NIGERIA", "FCT")),
+    geo_cache_row("level3", "CENTRAL", "CITY CENTRE", c("NIGERIA", "FCT", "AMAC"))
+  )
+  df <- data.frame(
+    country = "NIGERIA", state = "FCT", lga = "MUNICIPAL AREA COUNCIL",
+    ward = "CENTRAL", stringsAsFactors = FALSE
+  )
+  out <- .apply_geoname_cache(df, cache, c("country", "state", "lga", "ward"))
+  testthat::expect_equal(out$data$lga, "AMAC")
+  testthat::expect_equal(out$data$ward, "CITY CENTRE")
+})
+
+testthat::test_that("the newest correction of a name wins", {
+  cache <- rbind(
+    geo_cache_row("level2", "BWARRI", "AMAC", c("NIGERIA", "FCT"),
+      time = "2026-01-01 00:00:00 UTC"),
+    geo_cache_row("level2", "BWARRI", "BWARI", c("NIGERIA", "FCT"),
+      time = "2026-02-01 00:00:00 UTC")
+  )
+  deduped <- .dedupe_geoname_cache(cache)
+  testthat::expect_equal(nrow(deduped), 1)
+  testthat::expect_equal(deduped$replacement, "BWARI")
+})
+
+testthat::test_that("saving merges with the file and keeps same names in different places", {
+  cache_file <- tempfile(fileext = ".rds")
+  .save_geoname_cache(
+    geo_cache_row("level3", "CENTRAL", "CITY CENTRE", c("NIGERIA", "FCT", "AMAC")),
+    cache_file
+  )
+  .save_geoname_cache(
+    geo_cache_row("level3", "CENTRAL", "BWARI CENTRAL", c("NIGERIA", "FCT", "BWARI")),
+    cache_file
+  )
+  saved <- read(cache_file)
+  testthat::expect_equal(nrow(saved), 2)
+  testthat::expect_setequal(saved$replacement, c("CITY CENTRE", "BWARI CENTRAL"))
+  unlink(cache_file)
+})
+
+testthat::test_that("older cache formats are understood", {
+  old <- data.frame(
+    level = "district", name_to_match = "MUNICIPAL AREA COUNCIL",
+    replacement = NA, country_prepped = "NIGERIA", province_prepped = "FCT",
+    district_prepped = "AMAC", created_time = as.POSIXct("2025-01-01", tz = "UTC"),
+    stringsAsFactors = FALSE
+  )
+  std <- .standardise_geoname_cache(old)
+  testthat::expect_equal(std$level, "level2")
+  testthat::expect_equal(std$replacement, "AMAC")
+  testthat::expect_type(std$created_time, "character")
+})
+
+testthat::test_that("menu choices become cache rows with their parents", {
+  choices <- data.frame(
+    level = "level3", name_to_match = "CENTRALL", replacement = "CITY CENTRE",
+    longname_to_match = "NIGERIA_FCT_AMAC_CENTRALL",
+    longname_corrected = "NIGERIA_FCT_AMAC_CITY CENTRE",
+    created_time = "2026-01-01 00:00:00 UTC", stringsAsFactors = FALSE
+  )
+  rows <- .choices_to_cache(choices)
+  testthat::expect_equal(
+    unlist(rows[, paste0("level", 0:4, "_prepped")], use.names = FALSE),
+    c("NIGERIA", "FCT", "AMAC", "CITY CENTRE", NA)
+  )
+})
+
+testthat::test_that("default cache path follows the poliprep.geoname_cache option", {
+  withr::with_options(
+    list(poliprep.geoname_cache = "/some/where/cache.rds"),
+    testthat::expect_equal(.default_geoname_cache_path(), "/some/where/cache.rds")
+  )
+})
