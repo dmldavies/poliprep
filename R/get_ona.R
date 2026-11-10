@@ -521,13 +521,18 @@ flatten_ona_record <- function(x, parent_key = "", sep = "/") {
 #'         stops and returns an error message.
 get_ona_page <- function(api_url, api_token, times = 3,
                          show_progress = .ona_show_progress()) {
+  progress <- if (show_progress) .ona_download_progress() else NULL
+  # always close the bar, even if the request fails, or cli keeps redrawing
+  # it under every later message in the session
+  on.exit(if (!is.null(progress)) progress$done(), add = TRUE)
+
   tryCatch(
     {
       raw <- httr::RETRY(
         "GET",
         api_url,
         httr::add_headers(Authorization = paste("Token", api_token)),
-        if (show_progress) .ona_download_progress(environment()),
+        if (!is.null(progress)) progress$config,
         times = times,
         pause_cap = 30,
         terminate_on = c(400L, 401L, 403L, 404L)
@@ -566,12 +571,15 @@ get_ona_page <- function(api_url, api_token, times = 3,
 #' shows a percentage and ETA; ONA usually streams JSON without one, so the
 #' bar then shows the amount downloaded and the transfer rate.
 #'
-#' @param .envir The calling frame. The bar closes when that frame exits.
-#' @return An httr config object.
+#' @return A list: `config`, the httr config to pass to the request, and
+#'   `done()`, which closes the bar. Call `done()` when the request ends.
 #' @keywords internal
-.ona_download_progress <- function(.envir = parent.frame()) {
+.ona_download_progress <- function() {
   state <- new.env(parent = emptyenv())
   state$bar <- NULL
+  # the bar belongs to this function's frame, which stays alive for as long
+  # as `done()` and the callback exist; it's closed explicitly by done()
+  .envir <- environment()
 
   callback <- function(down, up) {
     total <- down[[1]]
@@ -610,7 +618,18 @@ get_ona_page <- function(api_url, api_token, times = 3,
     TRUE # returning anything else would abort the transfer
   }
 
-  httr::config(noprogress = FALSE, progressfunction = callback)
+  done <- function() {
+    if (!is.null(state$bar)) {
+      cli::cli_progress_done(id = state$bar, .envir = .envir)
+      state$bar <- NULL
+    }
+    invisible(NULL)
+  }
+
+  list(
+    config = httr::config(noprogress = FALSE, progressfunction = callback),
+    done = done
+  )
 }
 
 #' Validate and Normalize a Base URL
