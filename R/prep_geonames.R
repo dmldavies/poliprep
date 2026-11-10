@@ -397,6 +397,30 @@ handle_file_save <- function(data_to_save, default_save_path = NULL) {
   invisible(merged)
 }
 
+#' Recovery file for a menu session in progress
+#'
+#' Each choice is appended here the moment it is made, so stopping a long
+#' session part-way (Esc, an error, closing R) loses nothing: the next run
+#' moves these choices into the cache before it starts. The file is removed
+#' once the session is saved normally, or discarded with "Exit without
+#' saving".
+#' @keywords internal
+#' @noRd
+.geoname_session_path <- function(cache_path) {
+  paste0(sub("\\.[^./\\\\]+$", "", cache_path), "_unsaved_session.rds")
+}
+
+#' Append cache rows to the recovery file
+#' @keywords internal
+#' @noRd
+.append_geoname_session <- function(rows, path) {
+  previous <- if (file.exists(path)) readRDS(path) else NULL
+  saveRDS(
+    dplyr::bind_rows(.standardise_geoname_cache(previous), .standardise_geoname_cache(rows)),
+    path
+  )
+}
+
 #' Turn menu choices into cache rows
 #' @keywords internal
 #' @noRd
@@ -1223,7 +1247,8 @@ handle_user_interaction <- function(input_data, levels, level,
                                     clear_console = TRUE,
                                     max_options,
                                     column_width = 60,
-                                    existing_counts = NULL) {
+                                    existing_counts = NULL,
+                                    on_choice = NULL) {
   # Interactivity --------------------------------------------------------------
 
   # set up the messaging prompts at the start of the function
@@ -1480,6 +1505,7 @@ handle_user_interaction <- function(input_data, levels, level,
           created_time = format(Sys.time(), tz = "UTC", usetz = TRUE),
           reviewed = if (isTRUE(merge_ok)) "yes" else NA_character_
         )
+        if (is.function(on_choice)) on_choice(user_choices[[length(user_choices)]])
         cli::cli_alert_success("Manual name entered successfully.")
       } else {
         cli::cli_alert_warning("No name entered. Returning to menu...")
@@ -1509,6 +1535,7 @@ handle_user_interaction <- function(input_data, levels, level,
           reviewed = if (isTRUE(merge_ok)) "yes" else NA_character_
         )
       })
+      if (is.function(on_choice)) on_choice(user_choices[[length(user_choices)]])
       i <- i + 1
       if (clear_console) .clear_console()
     }
@@ -2196,6 +2223,32 @@ prep_geonames <- function(
     cache_path <- .default_geoname_cache_path()
   }
 
+  # choices from a menu session that was stopped part-way go into the cache
+  # first, so they are applied now and not asked again
+  session_path <- .geoname_session_path(cache_path)
+  if (file.exists(session_path)) {
+    recovered <- tryCatch(readRDS(session_path), error = function(e) NULL)
+    if (!is.null(recovered) && NROW(recovered) > 0) {
+      tryCatch(
+        {
+          .save_geoname_cache(recovered, cache_path)
+          unlink(session_path)
+          cli::cli_alert_success(paste0(
+            "Recovered {nrow(.dedupe_geoname_cache(recovered))} correction{?s} ",
+            "from a menu session that was stopped before it finished."
+          ))
+        },
+        error = function(e) {
+          cli::cli_alert_danger(
+            "Could not recover {.file {session_path}}: {conditionMessage(e)}"
+          )
+        }
+      )
+    } else {
+      unlink(session_path)
+    }
+  }
+
   saved_cache_df <- .read_geoname_cache(cache_path)
 
   # caches saved by earlier versions without a cache_path landed in the
@@ -2481,7 +2534,14 @@ prep_geonames <- function(
       level = level,
       max_options = max_options,
       column_width = column_width,
-      existing_counts = existing_counts
+      existing_counts = existing_counts,
+      # write each choice to the recovery file straight away
+      on_choice = function(choice) {
+        tryCatch(
+          .append_geoname_session(.choices_to_cache(choice), session_path),
+          error = function(e) NULL
+        )
+      }
     )
 
     # "Exit without saving": stop and keep none of this session's choices
@@ -2524,6 +2584,7 @@ prep_geonames <- function(
   # Step 4: save this session's corrections to the cache -----------------------
 
   if (exit_without_saving) {
+    unlink(session_path)
     new_cache_rows <- .standardise_geoname_cache(NULL)
     cli::cli_alert_warning(
       "Exited without saving: this session's choices were not applied or saved."
@@ -2537,6 +2598,7 @@ prep_geonames <- function(
           dplyr::bind_rows(saved_cache_df, new_cache_rows),
           cache_path
         )
+        unlink(session_path)
         cli::cli_alert_success(
           paste0(
             "Saved {nrow(new_cache_rows)} correction{?s} to {.file {cache_path}}; ",
@@ -2545,12 +2607,14 @@ prep_geonames <- function(
         )
       },
       error = function(e) {
-        cli::cli_alert_danger(
-          "Could not save corrections to {.file {cache_path}}: {conditionMessage(e)}"
-        )
+        cli::cli_alert_danger(paste0(
+          "Could not save corrections to {.file {cache_path}}: {conditionMessage(e)}. ",
+          "They are kept in {.file {session_path}} and will be added next run."
+        ))
       }
     )
   } else {
+    unlink(session_path)
     cli::cli_alert_warning(
       "No cleanings were made. Cache will not be updated."
     )

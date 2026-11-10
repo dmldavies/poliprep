@@ -24,6 +24,11 @@
 - The result keeps every input row in its original order.
 - Caches saved as .csv/.xlsx combine correctly with new corrections, and a
   cache that can't be read is never overwritten.
+- Menu choices are written to a recovery file (`<cache>_unsaved_session.rds`)
+  as they are made. If a session is stopped part-way (Esc, an error, closing
+  R), the next run moves those choices into the cache before it starts, so
+  they are not asked again. Previously nothing was saved until the very end
+  of the session.
 - New merge check (`merge_check`) against corrections that fold one place
   into another (e.g. ward AIGE SOLOMADE -> IPAKODO when IPAKODO already has
   its own rows, or GARKI II -> GARKI I). The menu shows how many rows already
