@@ -2187,3 +2187,72 @@ testthat::test_that("default cache path follows the poliprep.geoname_cache optio
     testthat::expect_equal(.default_geoname_cache_path(), "/some/where/cache.rds")
   )
 })
+
+# Merge check ---------------------------------------------------------------------
+
+testthat::test_that("suspicious merges: different-looking or differently numbered, into a name already in the data", {
+  testthat::expect_true(.is_suspicious_merge("AIGE SOLOMADE", "IPAKODO", 312))
+  testthat::expect_true(.is_suspicious_merge("GARKI II", "GARKI I", 10))
+  testthat::expect_false(.is_suspicious_merge("GARKII", "GARKI", 10))      # typo
+  testthat::expect_false(.is_suspicious_merge("AIGE SOLOMADE", "IPAKODO", 0)) # target not in data
+})
+
+testthat::test_that("merge check finds a ward folded into another and skips reviewed ones", {
+  levels <- c("country", "state", "lga", "ward")
+  before <- data.frame(
+    country = "NIGERIA", state = "LAGOS", lga = "IKORODU",
+    ward = c("IPAKODO", "AIGE SOLOMADE", "AIGE SOLOMADE", "ISIUU", "ISIU"),
+    stringsAsFactors = FALSE
+  )
+  after <- before
+  after$ward <- c("IPAKODO", "IPAKODO", "IPAKODO", "ISIU", "ISIU")
+
+  merges <- .find_geoname_merges(before, after, levels)
+  testthat::expect_equal(nrow(merges), 1)
+  testthat::expect_equal(merges$from, "AIGE SOLOMADE")
+  testthat::expect_equal(merges$to, "IPAKODO")
+  testthat::expect_equal(merges$rows, 2)
+  testthat::expect_equal(merges$where, "NIGERIA / LAGOS / IKORODU")
+
+  reviewed <- geo_cache_row(
+    "level3", "AIGE SOLOMADE", "IPAKODO", c("NIGERIA", "LAGOS", "IKORODU")
+  )
+  reviewed$reviewed <- "yes"
+  testthat::expect_equal(
+    nrow(.find_geoname_merges(before, after, levels, reviewed)), 0
+  )
+})
+
+testthat::test_that("an unreviewed merge from the cache warns in non-interactive runs", {
+  cache_file <- tempfile(fileext = ".rds")
+  saveRDS(
+    geo_cache_row("level3", "AIGE SOLOMADE", "IPAKODO", c("NIGERIA", "LAGOS", "IKORODU")),
+    cache_file
+  )
+  lookup <- data.frame(
+    country = "NIGERIA", state = "LAGOS", lga = "IKORODU",
+    ward = c("IPAKODO", "ISIU"), stringsAsFactors = FALSE
+  )
+  target <- data.frame(
+    country = "Nigeria", state = "Lagos", lga = "Ikorodu",
+    ward = c("Ipakodo", "Aige Solomade"), stringsAsFactors = FALSE
+  )
+  args <- list(
+    target, lookup_df = lookup, level0 = "country", level1 = "state",
+    level2 = "lga", level3 = "ward", cache_path = cache_file,
+    interactive = FALSE
+  )
+
+  testthat::expect_warning(
+    suppressMessages(do.call(prep_geonames, args)),
+    "AIGE SOLOMADE"
+  )
+  testthat::expect_error(
+    suppressMessages(do.call(prep_geonames, c(args, merge_check = "error"))),
+    "AIGE SOLOMADE"
+  )
+  testthat::expect_no_warning(
+    suppressMessages(do.call(prep_geonames, c(args, merge_check = "none")))
+  )
+  unlink(cache_file)
+})

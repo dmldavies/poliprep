@@ -18,7 +18,8 @@ prep_geonames(
   interactive = TRUE,
   max_options = 200,
   preserve_case = FALSE,
-  column_width = 60
+  column_width = 60,
+  merge_check = c("review", "warn", "error", "none")
 )
 }
 \arguments{
@@ -85,6 +86,22 @@ column in the interactive menu. Controls how much text is displayed
 before truncation. Default is 60 characters. Note that the actual
 text display width is approximately 8 characters less to accommodate
 number labels and truncation markers ("...").}
+
+\item{merge_check}{One of "review", "warn", "error" or "none". Guards against corrections that fold one place into
+another, e.g. ward AIGE SOLOMADE corrected to IPAKODO although IPAKODO
+already has rows of its own. A correction counts as a possible merge when
+the name it was changed to already appears in the data under the same
+parents and the two names look quite different, or are differently
+numbered places (GARKI I / GARKI II). Typo fixes are not affected. In the
+menu, each option shows how many rows already use it, and choosing such a
+name asks for confirmation. After every run the result is also checked
+(this catches merges coming from the cache):
+"review" (default) asks, in an interactive run, whether to keep each one
+(it is then marked as reviewed and not asked again) or undo it (the rows
+get their original name back and the cache entry is removed), and warns
+in a non-interactive run; "warn" always only warns; "error" stops with a
+list of the merges (useful in scheduled scripts); "none" turns the check
+off.}
 }
 \value{
 A data frame with cleaned administrative names and saved data frame

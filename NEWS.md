@@ -24,6 +24,14 @@
 - The result keeps every input row in its original order.
 - Caches saved as .csv/.xlsx combine correctly with new corrections, and a
   cache that can't be read is never overwritten.
+- New merge check (`merge_check`) against corrections that fold one place
+  into another (e.g. ward AIGE SOLOMADE -> IPAKODO when IPAKODO already has
+  its own rows, or GARKI II -> GARKI I). The menu shows how many rows already
+  use each option and asks before such a merge; after every run the result is
+  checked, and suspicious corrections are offered for keep/undo (interactive),
+  reported as a warning (batch) or, with `merge_check = "error"`, stop the
+  run. Confirmed merges are marked `reviewed` in the cache and not raised
+  again.
 
 # poliprep 1.3.0
 

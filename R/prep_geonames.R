@@ -134,7 +134,10 @@ handle_file_save <- function(data_to_save, default_save_path = NULL) {
 .geoname_cache_cols <- c(
   "level", "name_to_match", "replacement",
   paste0("level", 0:4, "_prepped"),
-  "created_time", "name_of_creator"
+  "created_time", "name_of_creator",
+  # "yes" once someone has confirmed that a correction merging two names that
+  # look different is intended (see .find_geoname_merges())
+  "reviewed"
 )
 
 #' Normalise admin names so that spelling, not spacing or case, is compared
@@ -428,7 +431,242 @@ handle_file_save <- function(data_to_save, default_save_path = NULL) {
   }
   out$created_time <- as.character(choices$created_time)
   out$name_of_creator <- get_user_identity()
+  if ("reviewed" %in% names(choices)) {
+    out$reviewed <- as.character(choices$reviewed)
+  }
   .standardise_geoname_cache(out)
+}
+
+# Merge check ----------------------------------------------------------------------
+#
+# A correction can wrongly fold one real place into another (e.g. ward
+# AIGE SOLOMADE -> IPAKODO in Ikorodu). These helpers spot corrections that
+# look like that, so they can be confirmed or undone.
+
+#' How different two names must be (Jaro-Winkler distance, 0-1) before folding
+#' one into the other counts as suspicious. Typos are well below this
+#' (GARKII/GARKI ~ 0.03); different places are well above it
+#' (AIGE SOLOMADE/IPAKODO ~ 0.5).
+#' @keywords internal
+#' @noRd
+.geoname_merge_distance <- 0.25
+
+#' Trailing number or letter that tells numbered places apart (GARKI I/II,
+#' TUDUN WADA 1/2, UNGUWAN A/B)
+#' @keywords internal
+#' @noRd
+.geoname_suffix_regex <- "\\s+(I{1,3}|IV|VI{0,3}|IX|X|[0-9]+|[A-D])$"
+
+#' Is replacing `from` with `to` a suspicious merge?
+#'
+#' Suspicious when `to` already has rows of its own and either looks quite
+#' different from `from`, or is a differently numbered place with the same
+#' base name.
+#' @keywords internal
+#' @noRd
+.is_suspicious_merge <- function(from, to, to_rows) {
+  from <- .normalise_geoname(from)
+  to <- .normalise_geoname(to)
+  distance <- stringdist::stringdist(from, to, method = "jw")
+  base_from <- sub(.geoname_suffix_regex, "", from)
+  base_to <- sub(.geoname_suffix_regex, "", to)
+  numbered <- base_from == base_to & from != to &
+    (grepl(.geoname_suffix_regex, from) | grepl(.geoname_suffix_regex, to))
+  from != to & to_rows > 0 & (distance > .geoname_merge_distance | numbered)
+}
+
+#' Find corrections that folded one place into another
+#'
+#' Compares names before and after cleaning, level by level. A row is
+#' reported when a name was changed into another name that also appears in
+#' the data in its own right (under the same parents), and the two look
+#' different or are differently numbered (see `.is_suspicious_merge()`).
+#' Corrections confirmed earlier (`reviewed == "yes"` in the cache) are left
+#' out.
+#'
+#' @param before,after The same rows before and after cleaning.
+#' @param levels Admin columns, top first.
+#' @param cache Current cache (for the reviewed flags).
+#' @return A data frame with one row per suspicious correction.
+#' @keywords internal
+#' @noRd
+.find_geoname_merges <- function(before, after, levels, cache = NULL) {
+  cache <- .dedupe_geoname_cache(cache)
+  cache_key <- .geoname_cache_key(cache)
+  reviewed_keys <- cache_key[!is.na(cache$reviewed) & cache$reviewed == "yes"]
+
+  found <- list()
+  parents <- rep("", NROW(after))
+  parent_label <- rep("", NROW(after))
+
+  for (k in seq_along(levels)) {
+    col <- levels[[k]]
+    from <- .normalise_geoname(before[[col]])
+    to <- .normalise_geoname(after[[col]])
+    ok <- !is.na(from) & !is.na(to)
+
+    if (any(ok)) {
+      counts <- data.frame(
+        parent = parents[ok], parent_label = parent_label[ok],
+        from = from[ok], to = to[ok], stringsAsFactors = FALSE
+      ) |>
+        dplyr::count(parent, parent_label, from, to, name = "rows")
+
+      # rows that carried the target name before cleaning
+      own <- counts[counts$from == counts$to, c("parent", "to", "rows")]
+      names(own)[3] <- "to_own_rows"
+
+      changed <- counts[counts$from != counts$to, , drop = FALSE] |>
+        dplyr::left_join(own, by = c("parent", "to")) |>
+        dplyr::mutate(to_own_rows = dplyr::coalesce(to_own_rows, 0L))
+
+      if (nrow(changed) > 0) {
+        changed$key <- paste(paste0("level", k - 1), changed$parent,
+          changed$from,
+          sep = "\x1e"
+        )
+        suspicious <- changed[
+          .is_suspicious_merge(changed$from, changed$to, changed$to_own_rows) &
+            !(changed$key %in% reviewed_keys), ,
+          drop = FALSE
+        ]
+        if (nrow(suspicious) > 0) {
+          suspicious$level <- col
+          suspicious$level_index <- k - 1
+          found[[length(found) + 1]] <- suspicious
+        }
+      }
+    }
+
+    parents <- paste0(parents, "\x1f", to)
+    parent_label <- ifelse(
+      parent_label == "", to, paste(parent_label, to, sep = " / ")
+    )
+  }
+
+  if (length(found) == 0) {
+    return(data.frame())
+  }
+  out <- dplyr::bind_rows(found)
+  out$where <- sub("^ / ", "", out$parent_label)
+  out[, c(
+    "level", "where", "from", "to", "rows", "to_own_rows",
+    "level_index", "parent", "key"
+  )]
+}
+
+#' Describe suspicious merges for the console
+#' @keywords internal
+#' @noRd
+.describe_geoname_merges <- function(merges) {
+  sprintf(
+    "%s: %s (%s rows) -> %s (already %s rows)%s",
+    merges$level, merges$from, merges$rows, merges$to, merges$to_own_rows,
+    ifelse(merges$where == "", "", paste0(" in ", merges$where))
+  )
+}
+
+#' Change rows in a cache file in place (locked)
+#' @keywords internal
+#' @noRd
+.update_geoname_cache <- function(path, update) {
+  if (requireNamespace("filelock", quietly = TRUE)) {
+    lock_path <- paste0(path, ".lock")
+    lock <- filelock::lock(lock_path, timeout = 10000)
+    if (!is.null(lock)) {
+      on.exit(
+        {
+          filelock::unlock(lock)
+          unlink(lock_path)
+        },
+        add = TRUE
+      )
+    }
+  }
+  cache <- .dedupe_geoname_cache(.read_geoname_cache(path))
+  cache <- update(cache, .geoname_cache_key(cache))
+  save(cache, path)
+  invisible(cache)
+}
+
+#' Ask, for each suspicious merge, whether to keep it or undo it
+#'
+#' Keep: the cache entry is marked reviewed and not asked about again.
+#' Undo: the cache entry is removed and the rows get their original name
+#' back, so the name is offered in the menu again on the next run.
+#'
+#' @return `after`, with undone merges reverted.
+#' @keywords internal
+#' @noRd
+.review_geoname_merges <- function(merges, before, after, levels, cache_path) {
+  keep_keys <- character()
+  undo_keys <- character()
+
+  cli::cli_h2("Merge check")
+  cli::cli_alert_warning(
+    "{nrow(merges)} correction{?s} fold{?s/} one place into another that is already in the data:"
+  )
+  for (i in seq_len(nrow(merges))) {
+    m <- merges[i, ]
+    cli::cli_text("")
+    cli::cli_text(
+      "{.strong {m$level}} {.val {m$from}} ({m$rows} rows) {cli::symbol$arrow_right} ",
+      "{.val {m$to}} (already {m$to_own_rows} rows)",
+      if (m$where != "") " in {m$where}" else ""
+    )
+    answer <- ""
+    while (!answer %in% c("k", "u")) {
+      answer <- tolower(trimws(readline(
+        "  [k] keep (they are the same place)  [u] undo: "
+      )))
+    }
+    if (answer == "k") keep_keys <- c(keep_keys, m$key)
+    if (answer == "u") undo_keys <- c(undo_keys, m$key)
+  }
+
+  # put the original names back on undone rows
+  if (length(undo_keys) > 0) {
+    undo <- merges[merges$key %in% undo_keys, , drop = FALSE]
+    parents <- rep("", NROW(after))
+    for (k in seq_along(levels)) {
+      col <- levels[[k]]
+      to <- .normalise_geoname(after[[col]])
+      from <- .normalise_geoname(before[[col]])
+      u <- undo[undo$level_index == k - 1, , drop = FALSE]
+      if (nrow(u) > 0) {
+        hit <- paste(parents, from, to, sep = "\x1e") %in%
+          paste(u$parent, u$from, u$to, sep = "\x1e")
+        after[[col]][hit] <- before[[col]][hit]
+      }
+      parents <- paste0(parents, "\x1f", .normalise_geoname(after[[col]]))
+    }
+  }
+
+  if (!is.null(cache_path) && file.exists(cache_path)) {
+    tryCatch(
+      .update_geoname_cache(cache_path, function(cache, key) {
+        cache$reviewed[key %in% keep_keys] <- "yes"
+        cache[!(key %in% undo_keys), , drop = FALSE]
+      }),
+      error = function(e) {
+        cli::cli_alert_danger(
+          "Could not update {.file {cache_path}}: {conditionMessage(e)}"
+        )
+      }
+    )
+  }
+
+  if (length(undo_keys) > 0) {
+    cli::cli_alert_success(
+      "Undid {length(undo_keys)} correction{?s}; you'll be asked about {?it/them} again next run."
+    )
+  }
+  if (length(keep_keys) > 0) {
+    cli::cli_alert_success(
+      "Kept {length(keep_keys)} correction{?s}; marked as reviewed."
+    )
+  }
+  after
 }
 
 #' Get Hierarchical Administrative Combinations
@@ -984,7 +1222,8 @@ calculate_string_distance <- function(
 handle_user_interaction <- function(input_data, levels, level,
                                     clear_console = TRUE,
                                     max_options,
-                                    column_width = 60) {
+                                    column_width = 60,
+                                    existing_counts = NULL) {
   # Interactivity --------------------------------------------------------------
 
   # set up the messaging prompts at the start of the function
@@ -1019,6 +1258,24 @@ handle_user_interaction <- function(input_data, levels, level,
   user_choices <- list()
   user_choice <- NULL
   save_and_exit <- FALSE
+
+  # rows already using `name` in this context (parent names joined by "_")
+  rows_in_data <- function(context, name) {
+    if (is.null(existing_counts)) return(0L)
+    n <- existing_counts[paste(context, toupper(name), sep = "\x1f")]
+    ifelse(is.na(n), 0L, as.integer(n))
+  }
+
+  # NA = not a suspicious merge; TRUE/FALSE = the user's answer
+  confirm_merge <- function(context, from, to) {
+    n <- rows_in_data(context, to)
+    if (!isTRUE(.is_suspicious_merge(from, to, n))) return(NA)
+    cli::cli_alert_warning(paste0(
+      "{.val {to}} already has {n} row{?s} here and does not look like ",
+      "{.val {from}}. Choosing it merges the two into one."
+    ))
+    tolower(trimws(readline("Merge them? [y/n]: "))) == "y"
+  }
 
   # loop through unmatched records in input_data
   # Initialize the index
@@ -1144,10 +1401,22 @@ handle_user_interaction <- function(input_data, levels, level,
       "M" = "Enter name manually"
     )
 
+    # show how many rows already use each option here, so picking a place
+    # that is already in the data (a merge) is visible
+    context <- if (level == levels[1]) "" else current_long_geo
+    option_rows <- vapply(
+      replacement_name, function(nm) rows_in_data(context, nm), integer(1)
+    )
+    option_labels <- ifelse(
+      option_rows > 0,
+      paste0(replacement_name, " [", option_rows, " rows]"),
+      replacement_name
+    )
+
     # present the menu to the user ---------------------------------------------
     user_choice <- display_custom_menu(
       title, main_header,
-      replacement_name,
+      option_labels,
       special_actions,
       prompt = prompt,
       column_width = column_width
@@ -1186,8 +1455,17 @@ handle_user_interaction <- function(input_data, levels, level,
       }
     } else if (user_choice == "m") { # Enter name manually
       manual_name <- readline(prompt = "Enter the name manually: ")
+      replace_int <- .normalise_geoname(manual_name)
+      merge_ok <- if (manual_name != "") {
+        confirm_merge(context, name_to_clean, replace_int)
+      } else {
+        NA
+      }
+      if (isFALSE(merge_ok)) {
+        cli::cli_alert_info("Not merged. Choose again.")
+        next
+      }
       if (manual_name != "") {
-        replace_int <- toupper(gsub("\u00A0", " ", manual_name))
         user_choices[[length(user_choices) + 1]] <- data.frame(
           level = level_label,
           name_to_match = name_to_clean,
@@ -1199,7 +1477,8 @@ handle_user_interaction <- function(input_data, levels, level,
           longname_corrected = ifelse(
             level != levels[1], paste0(long_geo, "_", replace_int), long_geo
           ),
-          created_time = format(Sys.time(), tz = "UTC", usetz = TRUE)
+          created_time = format(Sys.time(), tz = "UTC", usetz = TRUE),
+          reviewed = if (isTRUE(merge_ok)) "yes" else NA_character_
         )
         cli::cli_alert_success("Manual name entered successfully.")
       } else {
@@ -1208,8 +1487,13 @@ handle_user_interaction <- function(input_data, levels, level,
       i <- i + 1
       if (clear_console) .clear_console()
     } else {
+      replace_int <- toupper(replacement_name[suppressWarnings(as.integer(user_choice))])
+      merge_ok <- confirm_merge(context, name_to_clean, replace_int)
+      if (isFALSE(merge_ok)) {
+        cli::cli_alert_info("Not merged. Choose again.")
+        next
+      }
       suppressWarnings({
-        replace_int <- toupper(replacement_name[as.integer(user_choice)])
         user_choices[[length(user_choices) + 1]] <- data.frame(
           level = level_label,
           name_to_match = name_to_clean,
@@ -1221,7 +1505,8 @@ handle_user_interaction <- function(input_data, levels, level,
           longname_corrected = ifelse(
             level != levels[1], paste0(long_geo, "_", replace_int), long_geo
           ),
-          created_time = format(Sys.time(), tz = "UTC", usetz = TRUE)
+          created_time = format(Sys.time(), tz = "UTC", usetz = TRUE),
+          reviewed = if (isTRUE(merge_ok)) "yes" else NA_character_
         )
       })
       i <- i + 1
@@ -1571,6 +1856,21 @@ export_unmatched_data <- function(target_todo, unmatched_export_path,
 #'        before truncation. Default is 60 characters. Note that the actual
 #'        text display width is approximately 8 characters less to accommodate
 #'        number labels and truncation markers ("...").
+#' @param merge_check One of "review", "warn", "error" or "none". Guards against corrections that fold one place into
+#'        another, e.g. ward AIGE SOLOMADE corrected to IPAKODO although IPAKODO
+#'        already has rows of its own. A correction counts as a possible merge when
+#'        the name it was changed to already appears in the data under the same
+#'        parents and the two names look quite different, or are differently
+#'        numbered places (GARKI I / GARKI II). Typo fixes are not affected. In the
+#'        menu, each option shows how many rows already use it, and choosing such a
+#'        name asks for confirmation. After every run the result is also checked
+#'        (this catches merges coming from the cache):
+#'        "review" (default) asks, in an interactive run, whether to keep each one
+#'        (it is then marked as reviewed and not asked again) or undo it (the rows
+#'        get their original name back and the cache entry is removed), and warns
+#'        in a non-interactive run; "warn" always only warns; "error" stops with a
+#'        list of the merges (useful in scheduled scripts); "none" turns the check
+#'        off.
 #'
 #' @details
 #' The function performs the following steps:
@@ -1634,8 +1934,11 @@ prep_geonames <- function(
   interactive = TRUE,
   max_options = 200,
   preserve_case = FALSE,
-  column_width = 60
+  column_width = 60,
+  merge_check = c("review", "warn", "error", "none")
 ) {
+  merge_check <- match.arg(merge_check)
+
   # Capture the names of the data frames at the beginning
   target_df_name <- paste(deparse(substitute(target_df)), collapse = "")
   lookup_df_name <- paste(deparse(substitute(lookup_df)), collapse = "")
@@ -1878,6 +2181,9 @@ prep_geonames <- function(
       )
     )
 
+  # names as they arrived (tidied), to check the result against at the end
+  input_df <- target_df
+
   # Step 1: Apply corrections saved in earlier sessions ------------------------
   #
   # Every name corrected in the interactive menu is saved to the cache. Before
@@ -1938,6 +2244,52 @@ prep_geonames <- function(
   # result is built from this, so rows keep their order and none are dropped
   orig_df <- target_df
 
+  # Every exit goes through here: check for corrections that folded one place
+  # into another (e.g. ward AIGE SOLOMADE -> IPAKODO), then restore case.
+  finish <- function(out) {
+    if (merge_check != "none") {
+      cache_now <- tryCatch(
+        .dedupe_geoname_cache(dplyr::bind_rows(
+          saved_cache_df, .read_geoname_cache(cache_path)
+        )),
+        error = function(e) saved_cache_df
+      )
+      merges <- .find_geoname_merges(input_df, out, levels, cache_now)
+
+      if (nrow(merges) > 0) {
+        lines <- .describe_geoname_merges(merges)
+        if (merge_check == "error") {
+          cli::cli_abort(c(
+            "{nrow(merges)} correction{?s} merge{?s/} one place into another:",
+            stats::setNames(lines, rep("x", length(lines))),
+            "i" = paste0(
+              "Run interactively to keep or undo them, or remove them from ",
+              "{.file {cache_path}}."
+            )
+          ))
+        } else if (merge_check == "review" && interactive) {
+          out <- .review_geoname_merges(
+            merges, input_df, out, levels, cache_path
+          )
+        } else {
+          warning(
+            paste0(
+              nrow(merges), " geoname correction(s) merge one place into ",
+              "another; check them (run interactively to keep or undo):\n",
+              paste0("  ", lines, collapse = "\n")
+            ),
+            call. = FALSE
+          )
+        }
+      }
+    }
+
+    if (preserve_case) {
+      out <- apply_case_mapping(out, lookup_case_mapping, levels)
+    }
+    out
+  }
+
   # dynamically construct the long geonames on target data
   target_df <- construct_geo_names(
     target_df,
@@ -1985,12 +2337,7 @@ prep_geonames <- function(
       "All records matched; process completed. Exiting..."
     )
 
-    # Apply case mapping if preserve_case is TRUE
-    if (preserve_case) {
-      orig_df <- apply_case_mapping(orig_df, lookup_case_mapping, levels)
-    }
-
-    return(orig_df)
+    return(finish(orig_df))
   }
 
   # return if non-interactive.
@@ -2019,12 +2366,7 @@ prep_geonames <- function(
       )
     }
 
-    # Apply case mapping if preserve_case is TRUE
-    if (preserve_case) {
-      orig_df <- apply_case_mapping(orig_df, lookup_case_mapping, levels)
-    }
-
-    return(orig_df)
+    return(finish(orig_df))
   }
 
   cli::cli_alert_info(
@@ -2039,12 +2381,7 @@ prep_geonames <- function(
       "Exiting without interactive matching..."
     )
 
-    # Apply case mapping if preserve_case is TRUE
-    if (preserve_case) {
-      orig_df <- apply_case_mapping(orig_df, lookup_case_mapping, levels)
-    }
-
-    return(orig_df)
+    return(finish(orig_df))
   }
 
   # Step 3: String distance matching in interactivity --------------------------
@@ -2119,13 +2456,32 @@ prep_geonames <- function(
       next
     }
 
+    # how many rows already use each name at this level, by parent, with
+    # this session's corrections applied (shown in the menu, and used to
+    # ask before merging two places)
+    current_all <- .apply_geoname_cache(orig_df, new_cache_rows, levels)$data
+    current_parent <- if (k > 1) {
+      parent_key(current_all, levels[seq_len(k - 1)])
+    } else {
+      rep("", nrow(current_all))
+    }
+    has_name <- !is.na(current_all[[level]])
+    existing_counts <- table(paste(
+      current_parent[has_name], current_all[[level]][has_name],
+      sep = "\x1f"
+    ))
+    existing_counts <- stats::setNames(
+      as.integer(existing_counts), names(existing_counts)
+    )
+
     cli::cli_alert_info("Handling user interaction for level: {level}")
     replacement_df <- handle_user_interaction(
       input_data = top_res,
       levels = levels,
       level = level,
       max_options = max_options,
-      column_width = column_width
+      column_width = column_width,
+      existing_counts = existing_counts
     )
 
     # "Exit without saving": stop and keep none of this session's choices
@@ -2240,17 +2596,8 @@ prep_geonames <- function(
 
   gc() # clean up memory
 
-  # Apply case mapping if preserve_case is TRUE
-  if (preserve_case) {
-    finalised_df <- apply_case_mapping(
-      finalised_df,
-      lookup_case_mapping,
-      levels
-    )
-  }
-
-  # return the final data frame
-  finalised_df
+  # merge check, then case mapping; return the final data frame
+  finish(finalised_df)
 }
 
 #' Impute higher administrative level using a lookup table
