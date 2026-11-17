@@ -996,7 +996,7 @@ testthat::test_that("handle_user_interaction handles manual entry", {
   test_data <- data.frame(
     name_to_match = c("district1", "district1"),
     matched_names = c("District One", "D1"),
-    long_geo = c("country1_province1", "country1_province1"),
+    long_geo = c("country1\x1fprovince1", "country1\x1fprovince1"),
     stringsAsFactors = FALSE
   )
 
@@ -1007,7 +1007,8 @@ testthat::test_that("handle_user_interaction handles manual entry", {
   )
   mockery::stub(
     handle_user_interaction,
-    "readline", mockery::mock("Manual District")
+    # the typed name isn't one of the lookup's names, so it asks to confirm
+    "readline", mockery::mock("Manual District", "y")
   )
   mockery::stub(handle_user_interaction, "cat", function(...) NULL)
   mockery::stub(handle_user_interaction, "sample", function(x) x[1])
@@ -1033,11 +1034,11 @@ testthat::test_that("handle_user_interaction handles manual entry", {
   testthat::expect_equal(result$level, "level2")
   testthat::expect_equal(
     result$longname_to_match,
-    "country1_province1_district1"
+    "country1\x1fprovince1\x1fdistrict1"
   )
   testthat::expect_equal(
     result$longname_corrected,
-    "country1_province1_MANUAL DISTRICT"
+    "country1\x1fprovince1\x1fMANUAL DISTRICT"
   )
 })
 
@@ -1047,8 +1048,8 @@ testthat::test_that("handle_user_interaction processes multiple selections", {
     name_to_match = c("district1", "district2", "district3"),
     matched_names = c("District One", "District Two", "District Three"),
     long_geo = c(
-      "country1_province1",
-      "country1_province1", "country1_province1"
+      "country1\x1fprovince1",
+      "country1\x1fprovince1", "country1\x1fprovince1"
     ),
     stringsAsFactors = FALSE
   )
@@ -1092,9 +1093,9 @@ testthat::test_that("handle_user_interaction handles 'Save and exit' action", {
     name_to_match = c("settlement1", "settlement2", "settlement3"),
     matched_names = c("Settlement One", "Settlement Two", "Settlement Three"),
     long_geo = c(
-      "country1_province1_district1_subdistrict1",
-      "country1_province1_district1_subdistrict1",
-      "country1_province1_district1_subdistrict1"
+      "country1\x1fprovince1\x1fdistrict1\x1fsubdistrict1",
+      "country1\x1fprovince1\x1fdistrict1\x1fsubdistrict1",
+      "country1\x1fprovince1\x1fdistrict1\x1fsubdistrict1"
     ),
     stringsAsFactors = FALSE
   )
@@ -1177,9 +1178,9 @@ testthat::test_that("handle_user_interaction handles 'Go Back' action", {
     name_to_match = c("subdistrict1", "subdistrict1", "subdistrict2"),
     matched_names = c("Subdistrict One", "Subdistrict One Alt", "Subdistrict Two"),
     long_geo = c(
-      "country1_province1_district1",
-      "country1_province1_district1",
-      "country1_province1_district1"
+      "country1\x1fprovince1\x1fdistrict1",
+      "country1\x1fprovince1\x1fdistrict1",
+      "country1\x1fprovince1\x1fdistrict1"
     ),
     stringsAsFactors = FALSE
   )
@@ -2170,8 +2171,8 @@ testthat::test_that("older cache formats are understood", {
 testthat::test_that("menu choices become cache rows with their parents", {
   choices <- data.frame(
     level = "level3", name_to_match = "CENTRALL", replacement = "CITY CENTRE",
-    longname_to_match = "NIGERIA_FCT_AMAC_CENTRALL",
-    longname_corrected = "NIGERIA_FCT_AMAC_CITY CENTRE",
+    longname_to_match = "NIGERIA\x1fFCT\x1fAMAC\x1fCENTRALL",
+    longname_corrected = "NIGERIA\x1fFCT\x1fAMAC\x1fCITY CENTRE",
     created_time = "2026-01-01 00:00:00 UTC", stringsAsFactors = FALSE
   )
   rows <- .choices_to_cache(choices)
@@ -2255,4 +2256,202 @@ testthat::test_that("an unreviewed merge from the cache warns in non-interactive
     suppressMessages(do.call(prep_geonames, c(args, merge_check = "none")))
   )
   unlink(cache_file)
+})
+
+# Saved corrections must keep applying to new data --------------------------
+
+run_batch <- function(target, lookup = geo_lookup, cache_file, ...) {
+  suppressMessages(prep_geonames(
+    target, lookup_df = lookup, cache_path = cache_file,
+    interactive = FALSE, ...
+  ))
+}
+
+testthat::test_that("a saved correction also covers spacing and punctuation variants", {
+  cache_file <- tempfile(fileext = ".rds")
+  saveRDS(geo_cache_row("level1", "FCT, ABUJA", "FCT", "NIGERIA"), cache_file)
+  target <- data.frame(
+    country = "NIGERIA",
+    state = c("FCT, ABUJA", "FCT,ABUJA", "FCT - ABUJA", " fct . abuja "),
+    lga = "AMAC", ward = "GARKI", stringsAsFactors = FALSE
+  )
+  result <- run_batch(
+    target, cache_file = cache_file,
+    level0 = "country", level1 = "state", level2 = "lga", level3 = "ward"
+  )
+  testthat::expect_equal(result$state, rep("FCT", 4))
+  unlink(cache_file)
+})
+
+testthat::test_that("corrections saved with a country level apply without it, and back", {
+  with_country <- tempfile(fileext = ".rds")
+  saveRDS(
+    rbind(
+      geo_cache_row("level1", "FCT, ABUJA", "FCT", "NIGERIA"),
+      geo_cache_row("level3", "GARKII", "GARKI", c("NIGERIA", "FCT", "AMAC"))
+    ),
+    with_country
+  )
+  target <- data.frame(
+    state = "FCT, ABUJA", lga = "AMAC", ward = "GARKII",
+    stringsAsFactors = FALSE
+  )
+  result <- run_batch(
+    target, geo_lookup[, c("state", "lga", "ward")], with_country,
+    level0 = "state", level1 = "lga", level2 = "ward"
+  )
+  testthat::expect_equal(c(result$state, result$ward), c("FCT", "GARKI"))
+
+  without_country <- tempfile(fileext = ".rds")
+  saveRDS(geo_cache_row("level0", "FCT, ABUJA", "FCT"), without_country)
+  result <- run_batch(
+    data.frame(country = "NIGERIA", state = "FCT, ABUJA", lga = "AMAC", ward = "GARKI"),
+    cache_file = without_country,
+    level0 = "country", level1 = "state", level2 = "lga", level3 = "ward"
+  )
+  testthat::expect_equal(result$state, "FCT")
+  unlink(c(with_country, without_country))
+})
+
+testthat::test_that("a correction from another level layout is not used when it doesn't fit", {
+  cache_file <- tempfile(fileext = ".rds")
+  # saved under KANO; the data has the same misspelling under FCT
+  saveRDS(geo_cache_row("level2", "AMACC", "NASARAWA", c("NIGERIA", "KANO")), cache_file)
+  target <- data.frame(state = "FCT", lga = "AMACC", ward = "GARKI")
+  result <- run_batch(
+    target, geo_lookup[, c("state", "lga", "ward")], cache_file,
+    level0 = "state", level1 = "lga", level2 = "ward"
+  )
+  testthat::expect_equal(result$lga, "AMACC")
+  unlink(cache_file)
+})
+
+testthat::test_that("a saved correction is not used when the name is now in the lookup", {
+  cache_file <- tempfile(fileext = ".rds")
+  saveRDS(
+    geo_cache_row("level3", "CITY CENTRE", "GARKI", c("NIGERIA", "FCT", "AMAC")),
+    cache_file
+  )
+  target <- data.frame(
+    country = "NIGERIA", state = "FCT", lga = "AMAC", ward = "CITY CENTRE"
+  )
+  msgs <- testthat::capture_messages(
+    result <- prep_geonames(
+      target, lookup_df = geo_lookup, cache_path = cache_file,
+      interactive = FALSE, level0 = "country", level1 = "state",
+      level2 = "lga", level3 = "ward"
+    )
+  )
+  testthat::expect_equal(result$ward, "CITY CENTRE")
+  testthat::expect_true(any(grepl("already in the lookup", msgs)))
+  unlink(cache_file)
+})
+
+testthat::test_that("a saved correction to a name the lookup lacks is reported", {
+  cache_file <- tempfile(fileext = ".rds")
+  saveRDS(
+    geo_cache_row("level3", "GARKII", "GARKI 2", c("NIGERIA", "FCT", "AMAC")),
+    cache_file
+  )
+  target <- data.frame(country = "NIGERIA", state = "FCT", lga = "AMAC", ward = "GARKII")
+  msgs <- testthat::capture_messages(prep_geonames(
+    target, lookup_df = geo_lookup, cache_path = cache_file,
+    interactive = FALSE, level0 = "country", level1 = "state",
+    level2 = "lga", level3 = "ward"
+  ))
+  testthat::expect_true(any(grepl("isn't in the", msgs)))
+  unlink(cache_file)
+})
+
+testthat::test_that("names with underscores keep their corrections", {
+  lookup <- data.frame(
+    state = "FCT", lga = "ABUJA_MUNICIPAL", ward = c("GARKI", "WUSE")
+  )
+  choices <- data.frame(
+    level = "level2", name_to_match = "GARKII", replacement = "GARKI",
+    longname_to_match = "FCT\x1fABUJA_MUNICIPAL\x1fGARKII",
+    longname_corrected = "FCT\x1fABUJA_MUNICIPAL\x1fGARKI",
+    created_time = "2026-01-01 00:00:00 UTC", stringsAsFactors = FALSE
+  )
+  rows <- .choices_to_cache(choices)
+  testthat::expect_equal(rows$level1_prepped, "ABUJA_MUNICIPAL")
+
+  cache_file <- tempfile(fileext = ".rds")
+  saveRDS(rows, cache_file)
+  result <- run_batch(
+    data.frame(state = "FCT", lga = "ABUJA_MUNICIPAL", ward = "GARKII"),
+    lookup, cache_file,
+    level0 = "state", level1 = "lga", level2 = "ward"
+  )
+  testthat::expect_equal(result$ward, "GARKI")
+  unlink(cache_file)
+})
+
+testthat::test_that("names differing only in spacing or punctuation take the lookup's spelling", {
+  lookup <- data.frame(
+    state = "FCT",
+    ward = c("GARKI I", "GARKI II", "SHA'ANU", "TUDUN WADA", "TUDUN-WADA")
+  )
+  target <- data.frame(
+    state = "FCT",
+    ward = c("GARKI-II", "GARKII", "SHAANU", "TUDUN WADA."),
+    stringsAsFactors = FALSE
+  )
+  result <- .match_geonames_loosely(target, lookup, c("state", "ward"))
+  # GARKII could be GARKI I or GARKI II; TUDUN WADA. fits two lookup names
+  testthat::expect_equal(
+    result$data$ward, c("GARKI II", "GARKII", "SHA'ANU", "TUDUN WADA.")
+  )
+  testthat::expect_equal(result$rows, 2)
+})
+
+testthat::test_that("corrections are still saved when the cache can't be locked", {
+  cache_file <- tempfile(fileext = ".rds")
+  mockery::stub(
+    .save_geoname_cache, ".lock_geoname_cache",
+    function(path) NULL
+  )
+  suppressMessages(.save_geoname_cache(
+    geo_cache_row("level1", "FCT, ABUJA", "FCT", "NIGERIA"), cache_file
+  ))
+  testthat::expect_equal(nrow(readRDS(cache_file)), 1)
+
+  # a lock that errors (e.g. OneDrive) only gives a warning message
+  testthat::skip_if_not_installed("filelock")
+  mockery::stub(
+    .lock_geoname_cache, "filelock::lock",
+    function(...) stop("Permission denied")
+  )
+  testthat::expect_null(suppressMessages(.lock_geoname_cache(cache_file)))
+  unlink(cache_file)
+})
+
+testthat::test_that("an empty level column doesn't stop saved corrections", {
+  cache_file <- tempfile(fileext = ".rds")
+  saveRDS(geo_cache_row("level1", "FCT, ABUJA", "FCT", "NIGERIA"), cache_file)
+  target <- data.frame(
+    country = NA, state = "FCT, ABUJA", lga = "AMAC", ward = "GARKI"
+  )
+  testthat::expect_no_error(run_batch(
+    target, cache_file = cache_file,
+    level0 = "country", level1 = "state", level2 = "lga", level3 = "ward"
+  ))
+  unlink(cache_file)
+})
+
+testthat::test_that("a reviewed merge stays reviewed for punctuation variants", {
+  levels <- c("country", "state", "lga", "ward")
+  before <- data.frame(
+    country = "NIGERIA", state = "LAGOS", lga = "IKORODU",
+    ward = c("IPAKODO", "AIGE/SOLOMADE"), stringsAsFactors = FALSE
+  )
+  after <- before
+  after$ward <- "IPAKODO"
+  reviewed <- geo_cache_row(
+    "level3", "AIGE SOLOMADE", "IPAKODO", c("NIGERIA", "LAGOS", "IKORODU")
+  )
+  reviewed$reviewed <- "yes"
+  testthat::expect_equal(
+    nrow(.find_geoname_merges(before, after, levels, reviewed)), 0
+  )
 })

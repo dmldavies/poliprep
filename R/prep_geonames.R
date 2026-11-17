@@ -148,9 +148,63 @@ handle_file_save <- function(data_to_save, default_save_path = NULL) {
 #' @noRd
 .normalise_geoname <- function(x) {
   if (is.factor(x)) x <- as.character(x)
+  # a column that is entirely empty arrives as logical NA
+  if (is.logical(x) && all(is.na(x))) x <- as.character(x)
   if (!is.character(x)) return(x)
   # str_squish() treats tabs, line breaks and non-breaking spaces as spaces
   toupper(stringr::str_squish(x))
+}
+
+#' Key used to decide whether two admin names are the same name
+#'
+#' Like `.normalise_geoname()`, but punctuation is ignored too: apostrophes
+#' are dropped and other punctuation counts as a space. So "FCT, ABUJA",
+#' "FCT,ABUJA", "FCT - ABUJA" and "FCT. ABUJA" share one key, and so do
+#' "BIRNIN MAGAJI/KIYAW" and "BIRNIN MAGAJI KIYAW". Letters, digits and word
+#' breaks still count, so GARKI I and GARKI II stay different.
+#' @keywords internal
+#' @noRd
+.geoname_match_key <- function(x) {
+  x <- .normalise_geoname(x)
+  if (!is.character(x)) return(x)
+  x <- gsub("['’`]", "", x)
+  x <- gsub("[[:punct:]]+", " ", x)
+  stringr::str_squish(x)
+}
+
+#' Lock a cache file if possible
+#'
+#' Returns the lock, or NULL when no lock could be taken (filelock not
+#' installed, or the folder doesn't allow it, as happens in OneDrive and
+#' SharePoint folders). Saving then goes ahead without a lock rather than
+#' failing, so corrections are never lost because of the lock.
+#' @keywords internal
+#' @noRd
+.lock_geoname_cache <- function(path) {
+  if (!requireNamespace("filelock", quietly = TRUE)) return(NULL)
+  lock_path <- paste0(path, ".lock")
+  lock <- tryCatch(
+    filelock::lock(lock_path, timeout = 10000),
+    error = function(e) {
+      cli::cli_alert_warning(c(
+        "Couldn't lock {.file {path}} ({conditionMessage(e)}); ",
+        "saving without a lock."
+      ))
+      NULL
+    }
+  )
+  if (!is.null(lock)) attr(lock, "lock_path") <- lock_path
+  lock
+}
+
+#' Release a lock from `.lock_geoname_cache()`
+#' @keywords internal
+#' @noRd
+.unlock_geoname_cache <- function(lock) {
+  if (is.null(lock)) return(invisible())
+  try(filelock::unlock(lock), silent = TRUE)
+  try(unlink(attr(lock, "lock_path")), silent = TRUE)
+  invisible()
 }
 
 #' Default location of the geoname cache
@@ -244,6 +298,9 @@ handle_file_save <- function(data_to_save, default_save_path = NULL) {
 }
 
 #' Key identifying one correction: level + parent names + original name
+#'
+#' Names are compared with `.geoname_match_key()`, so a correction made for
+#' "FCT, ABUJA" also covers "FCT,ABUJA" and "FCT - ABUJA".
 #' @keywords internal
 #' @noRd
 .geoname_cache_key <- function(cache) {
@@ -251,14 +308,41 @@ handle_file_save <- function(data_to_save, default_save_path = NULL) {
   parents <- rep("", nrow(cache))
   for (j in 0:3) {
     has_parent <- !is.na(k) & k > j
-    parent_name <- .normalise_geoname(cache[[paste0("level", j, "_prepped")]])
+    parent_name <- .geoname_match_key(cache[[paste0("level", j, "_prepped")]])
     parents[has_parent] <- paste0(
       parents[has_parent], "\x1f", parent_name[has_parent]
     )
   }
-  paste(cache$level, parents, .normalise_geoname(cache$name_to_match),
+  paste(cache$level, parents, .geoname_match_key(cache$name_to_match),
     sep = "\x1e"
   )
+}
+
+#' Parent chains and names of the lookup, level by level
+#'
+#' For each level, the set of "<parents>\x1e<name>" keys (match keys, parents
+#' joined by \x1f from the top) and, per key, the lookup's own spelling.
+#' @keywords internal
+#' @noRd
+.geoname_lookup_index <- function(lookup, levels) {
+  if (is.null(lookup) || NROW(lookup) == 0) return(NULL)
+  out <- vector("list", length(levels))
+  parents <- rep("", NROW(lookup))
+  for (k in seq_along(levels)) {
+    col <- levels[[k]]
+    name <- .normalise_geoname(lookup[[col]])
+    mk <- .geoname_match_key(name)
+    key <- paste(parents, mk, sep = "\x1e")
+    ok <- !is.na(name)
+    spelling <- tapply(name[ok], key[ok], function(v) {
+      v <- unique(v)
+      # two lookup spellings with the same key: ambiguous, don't pick one
+      if (length(v) == 1) v else NA_character_
+    })
+    out[[k]] <- list(keys = unique(key[ok]), spelling = spelling)
+    parents <- paste0(parents, "\x1f", mk)
+  }
+  out
 }
 
 #' Keep only the most recent decision for each correction
@@ -291,42 +375,219 @@ handle_file_save <- function(data_to_save, default_save_path = NULL) {
 #'   corrections used).
 #' @keywords internal
 #' @noRd
-.apply_geoname_cache <- function(df, cache, levels) {
-  cache <- .dedupe_geoname_cache(cache)
-  if (nrow(cache) == 0 || NROW(df) == 0) {
-    return(list(data = df, rows = 0L, names = 0L))
+.apply_geoname_cache <- function(df, cache, levels, lookup = NULL) {
+  empty_report <- data.frame(
+    level = character(), where = character(), from = character(),
+    to = character(), stringsAsFactors = FALSE
+  )
+  result <- function(df, rows = 0L, names = 0L, layout = 0L,
+                     now_valid = empty_report, not_in_lookup = empty_report) {
+    list(
+      data = df, rows = rows, names = names, layout = layout,
+      now_valid = now_valid, not_in_lookup = not_in_lookup
+    )
   }
 
+  cache <- .dedupe_geoname_cache(cache)
+  if (nrow(cache) == 0 || NROW(df) == 0) {
+    return(result(df))
+  }
+
+  # with a lookup: corrections are only used where the name isn't already a
+  # valid place, and corrections saved with a different set of levels can be
+  # recognised (see below)
+  index <- .geoname_lookup_index(lookup, levels)
+
   cache_key <- .geoname_cache_key(cache)
+  cache_k <- suppressWarnings(as.integer(sub("^level", "", cache$level)))
+  cache_name <- .geoname_match_key(cache$name_to_match)
+  cache_parents <- lapply(seq_len(nrow(cache)), function(i) {
+    k <- cache_k[i]
+    if (is.na(k) || k == 0) return(character())
+    vapply(
+      seq_len(k) - 1L,
+      function(j) .geoname_match_key(cache[[paste0("level", j, "_prepped")]][[i]]),
+      character(1)
+    )
+  })
   replacement <- .normalise_geoname(cache$replacement)
+
   changed <- rep(FALSE, nrow(df))
   used <- character()
-  parents <- rep("", nrow(df))
+  layout_used <- character()
+  now_valid <- list()
+  not_in_lookup <- list()
+  parents <- rep("", nrow(df)) # match keys of the parents, \x1f-joined
+  parent_cols <- list() # match keys of each parent level, for the fallback
+  where <- rep("", nrow(df)) # readable parents, for messages
+
+  report <- function(hit, k, col, from, to) {
+    if (!any(hit)) return(NULL)
+    unique(data.frame(
+      level = col, where = where[hit], from = from[hit], to = to[hit],
+      stringsAsFactors = FALSE
+    ))
+  }
 
   for (k in seq_along(levels) - 1L) {
     col <- levels[[k + 1L]]
     current <- .normalise_geoname(df[[col]])
+    original <- current
+    current_key <- .geoname_match_key(current)
     level_rows <- which(cache$level == paste0("level", k))
 
+    valid_here <- if (!is.null(index)) {
+      paste(parents, current_key, sep = "\x1e") %in% index[[k + 1L]]$keys
+    } else {
+      rep(FALSE, nrow(df))
+    }
+
+    # 1. corrections saved for this level, these parents and this name
     if (length(level_rows) > 0) {
-      key <- paste(paste0("level", k), parents, current, sep = "\x1e")
+      key <- paste(paste0("level", k), parents, current_key, sep = "\x1e")
       m <- match(key, cache_key[level_rows])
-      hit <- !is.na(m) & !is.na(current) &
+      found <- !is.na(m) & !is.na(current) &
         !is.na(replacement[level_rows][m])
+      new_value <- replacement[level_rows][m]
+
+      # the name is a real place in the current lookup: leave it alone (the
+      # correction was made against an older lookup, or by mistake)
+      skip <- found & valid_here & new_value != current
+      now_valid[[length(now_valid) + 1]] <-
+        report(skip, k, col, current, new_value)
+      hit <- found & !valid_here
+
       if (any(hit)) {
-        new_value <- replacement[level_rows][m[hit]]
-        differs <- new_value != current[hit]
-        df[[col]][hit] <- new_value
-        current[hit] <- new_value
+        differs <- new_value[hit] != current[hit]
+        df[[col]][hit] <- new_value[hit]
         changed[which(hit)[differs]] <- TRUE
         used <- c(used, key[hit][differs])
+        current[hit] <- new_value[hit]
+        current_key[hit] <- .geoname_match_key(new_value[hit])
       }
     }
 
-    parents <- paste0(parents, "\x1f", current)
+    # 2. the same name corrected in a run with one level more or less (e.g.
+    # with and without a country column). Used only when the parents they
+    # share agree, exactly one replacement fits, and that replacement is a
+    # real place here.
+    if (!is.null(index)) {
+      valid_now <- paste(parents, current_key, sep = "\x1e") %in%
+        index[[k + 1L]]$keys
+      open <- which(!valid_now & !is.na(current) & current_key %in% cache_name)
+      if (length(open) > 0) {
+        combo <- paste(parents[open], current_key[open], sep = "\x1e")
+        for (cb in unique(combo)) {
+          rows <- open[combo == cb]
+          i <- rows[[1]]
+          chain <- vapply(parent_cols, function(p) p[[i]], character(1))
+          cand <- which(
+            cache_name == current_key[[i]] &
+              !is.na(cache_k) & abs(cache_k - k) <= 1 &
+              !is.na(replacement)
+          )
+          cand <- cand[vapply(cand, function(j) {
+            e <- cache_parents[[j]]
+            n <- min(length(e), length(chain))
+            n == 0 || identical(utils::tail(e, n), utils::tail(chain, n))
+          }, logical(1))]
+          to <- unique(replacement[cand])
+          if (length(to) != 1) next
+          to_key <- paste(parents[[i]], .geoname_match_key(to), sep = "\x1e")
+          if (!to_key %in% index[[k + 1L]]$keys) next
+          differs <- to != current[rows]
+          df[[col]][rows] <- to
+          changed[rows[differs]] <- TRUE
+          layout_used <- c(layout_used, cb)
+          used <- c(used, paste0("layout\x1e", cb))
+          current[rows] <- to
+          current_key[rows] <- .geoname_match_key(to)
+        }
+      }
+
+      # corrections that lead to a name the lookup doesn't have: these rows
+      # will still be asked about, so say why
+      set_here <- !is.na(current) & !is.na(original) & current != original
+      bad <- set_here &
+        !(paste(parents, current_key, sep = "\x1e") %in% index[[k + 1L]]$keys)
+      not_in_lookup[[length(not_in_lookup) + 1]] <-
+        report(bad, k, col, original, current)
+    }
+
+    parents <- paste0(parents, "\x1f", current_key)
+    parent_cols[[length(parent_cols) + 1]] <- current_key
+    where <- ifelse(
+      where == "", ifelse(is.na(current), "", current),
+      paste(where, ifelse(is.na(current), "?", current), sep = " / ")
+    )
   }
 
-  list(data = df, rows = sum(changed), names = length(unique(used)))
+  result(
+    df,
+    rows = sum(changed),
+    names = length(unique(used)),
+    layout = length(unique(layout_used)),
+    now_valid = dplyr::bind_rows(empty_report, now_valid),
+    not_in_lookup = dplyr::bind_rows(empty_report, not_in_lookup)
+  )
+}
+
+#' Print a short list of corrections (level, where, from -> to)
+#' @param x Data frame with level, where, from, to.
+#' @param header cli message; `{n}` is the number of rows in `x`.
+#' @keywords internal
+#' @noRd
+.report_geoname_list <- function(x, header, type = c("info", "warning"),
+                                 max_lines = 10) {
+  type <- match.arg(type)
+  if (is.null(x) || NROW(x) == 0) return(invisible())
+  x <- unique(x[, c("level", "where", "from", "to")])
+  n <- nrow(x)
+  alert <- if (type == "info") cli::cli_alert_info else cli::cli_alert_warning
+  alert(header, .envir = environment())
+  lines <- sprintf(
+    "%s: %s -> %s%s", x$level, x$from, x$to,
+    ifelse(x$where == "", "", paste0(" (", x$where, ")"))
+  )
+  for (line in utils::head(lines, max_lines)) {
+    cli::cli_text(cli::col_silver(paste0("  ", line)))
+  }
+  if (n > max_lines) {
+    cli::cli_text(cli::col_silver(paste0("  ... and ", n - max_lines, " more")))
+  }
+  invisible()
+}
+
+#' Use the lookup's spelling where a name differs only in spacing or
+#' punctuation
+#'
+#' "FCT,ABUJA" becomes the lookup's "FCT, ABUJA" and "BIRNIN MAGAJI KIYAW"
+#' becomes "BIRNIN MAGAJI/KIYAW", without asking. Goes level by level from the
+#' top, within the full parent, and only when exactly one lookup name fits.
+#' Rows are never added, dropped or reordered.
+#' @return A list: `data` and `rows` (rows changed).
+#' @keywords internal
+#' @noRd
+.match_geonames_loosely <- function(df, lookup, levels) {
+  index <- .geoname_lookup_index(lookup, levels)
+  if (is.null(index) || NROW(df) == 0) return(list(data = df, rows = 0L))
+  changed <- rep(FALSE, NROW(df))
+  parents <- rep("", NROW(df))
+  for (k in seq_along(levels)) {
+    col <- levels[[k]]
+    current <- .normalise_geoname(df[[col]])
+    key <- paste(parents, .geoname_match_key(current), sep = "\x1e")
+    spelling <- unname(index[[k]]$spelling[key])
+    fix <- !is.na(current) & !is.na(spelling) & spelling != current
+    if (any(fix)) {
+      df[[col]][fix] <- spelling[fix]
+      changed[fix] <- TRUE
+    }
+    parents <- paste0(parents, "\x1f", .geoname_match_key(
+      ifelse(fix, spelling, current)
+    ))
+  }
+  list(data = df, rows = sum(changed))
 }
 
 #' Read a geoname cache file (missing file = empty cache)
@@ -359,19 +620,8 @@ handle_file_save <- function(data_to_save, default_save_path = NULL) {
     dir.create(dirname(path), recursive = TRUE)
   }
 
-  if (requireNamespace("filelock", quietly = TRUE)) {
-    lock_path <- paste0(path, ".lock")
-    lock <- filelock::lock(lock_path, timeout = 10000)
-    if (!is.null(lock)) {
-      on.exit(
-        {
-          filelock::unlock(lock)
-          unlink(lock_path)
-        },
-        add = TRUE
-      )
-    }
-  }
+  lock <- .lock_geoname_cache(path)
+  on.exit(.unlock_geoname_cache(lock), add = TRUE)
 
   existing <- tryCatch(
     .read_geoname_cache(path),
@@ -429,8 +679,8 @@ handle_file_save <- function(data_to_save, default_save_path = NULL) {
     return(.standardise_geoname_cache(NULL))
   }
   k <- as.integer(sub("^level", "", choices$level))
-  # longname_corrected is "<parent>_<parent>_..._<replacement>"
-  parts <- strsplit(as.character(choices$longname_corrected), "_", fixed = TRUE)
+  # longname_corrected is "<parent>\x1f<parent>\x1f...\x1f<replacement>"
+  parts <- strsplit(as.character(choices$longname_corrected), "\x1f", fixed = TRUE)
 
   out <- data.frame(
     level = choices$level,
@@ -521,6 +771,7 @@ handle_file_save <- function(data_to_save, default_save_path = NULL) {
 
   found <- list()
   parents <- rep("", NROW(after))
+  parent_keys <- rep("", NROW(after)) # match keys, as in the cache key
   parent_label <- rep("", NROW(after))
 
   for (k in seq_along(levels)) {
@@ -531,10 +782,11 @@ handle_file_save <- function(data_to_save, default_save_path = NULL) {
 
     if (any(ok)) {
       counts <- data.frame(
-        parent = parents[ok], parent_label = parent_label[ok],
+        parent = parents[ok], parent_key = parent_keys[ok],
+        parent_label = parent_label[ok],
         from = from[ok], to = to[ok], stringsAsFactors = FALSE
       ) |>
-        dplyr::count(parent, parent_label, from, to, name = "rows")
+        dplyr::count(parent, parent_key, parent_label, from, to, name = "rows")
 
       # rows that carried the target name before cleaning
       own <- counts[counts$from == counts$to, c("parent", "to", "rows")]
@@ -545,8 +797,8 @@ handle_file_save <- function(data_to_save, default_save_path = NULL) {
         dplyr::mutate(to_own_rows = dplyr::coalesce(to_own_rows, 0L))
 
       if (nrow(changed) > 0) {
-        changed$key <- paste(paste0("level", k - 1), changed$parent,
-          changed$from,
+        changed$key <- paste(paste0("level", k - 1), changed$parent_key,
+          .geoname_match_key(changed$from),
           sep = "\x1e"
         )
         suspicious <- changed[
@@ -563,6 +815,7 @@ handle_file_save <- function(data_to_save, default_save_path = NULL) {
     }
 
     parents <- paste0(parents, "\x1f", to)
+    parent_keys <- paste0(parent_keys, "\x1f", .geoname_match_key(to))
     parent_label <- ifelse(
       parent_label == "", to, paste(parent_label, to, sep = " / ")
     )
@@ -594,19 +847,8 @@ handle_file_save <- function(data_to_save, default_save_path = NULL) {
 #' @keywords internal
 #' @noRd
 .update_geoname_cache <- function(path, update) {
-  if (requireNamespace("filelock", quietly = TRUE)) {
-    lock_path <- paste0(path, ".lock")
-    lock <- filelock::lock(lock_path, timeout = 10000)
-    if (!is.null(lock)) {
-      on.exit(
-        {
-          filelock::unlock(lock)
-          unlink(lock_path)
-        },
-        add = TRUE
-      )
-    }
-  }
+  lock <- .lock_geoname_cache(path)
+  on.exit(.unlock_geoname_cache(lock), add = TRUE)
   cache <- .dedupe_geoname_cache(.read_geoname_cache(path))
   cache <- update(cache, .geoname_cache_key(cache))
   save(cache, path)
@@ -833,7 +1075,7 @@ calculate_match_stats <- function(
     if (length(fields) == 1) {
       return(unique(combos[[fields]]))
     }
-    unique(do.call(paste, c(combos[fields], sep = "_")))
+    unique(do.call(paste, c(combos[fields], sep = "\x1f")))
   }
 
   resolve_label <- function(label, fallback) {
@@ -1284,7 +1526,7 @@ handle_user_interaction <- function(input_data, levels, level,
   user_choice <- NULL
   save_and_exit <- FALSE
 
-  # rows already using `name` in this context (parent names joined by "_")
+  # rows already using `name` in this context (parent names joined by \x1f)
   rows_in_data <- function(context, name) {
     if (is.null(existing_counts)) return(0L)
     n <- existing_counts[paste(context, toupper(name), sep = "\x1f")]
@@ -1361,10 +1603,10 @@ handle_user_interaction <- function(input_data, levels, level,
       level_label <- "level2"
       long_geo <- unique_geo_long$long_geo[1]
       long_geo_country <- stringr::str_to_title(
-        strsplit(long_geo, "_")[[1]][[1]]
+        strsplit(long_geo, "\x1f", fixed = TRUE)[[1]][[1]]
       )
       long_geo_province <- stringr::str_to_title(
-        strsplit(long_geo, "_")[[1]][[2]]
+        strsplit(long_geo, "\x1f", fixed = TRUE)[[1]][[2]]
       )
       str_cache <- stringr::str_to_title(name_to_clean)
       title <- glue::glue(
@@ -1375,7 +1617,7 @@ handle_user_interaction <- function(input_data, levels, level,
     } else if (!is.na(levels[4]) && level == levels[4]) {
       level_label <- "level3"
       long_geo <- unique_geo_long$long_geo[1]
-      long_geo_split <- strsplit(long_geo, "_")[[1]]
+      long_geo_split <- strsplit(long_geo, "\x1f", fixed = TRUE)[[1]]
       long_geo_country <- stringr::str_to_title(long_geo_split[1])
       long_geo_province <- stringr::str_to_title(long_geo_split[2])
       long_geo_district <- stringr::str_to_title(long_geo_split[3])
@@ -1388,7 +1630,7 @@ handle_user_interaction <- function(input_data, levels, level,
     } else if (!is.na(levels[5]) && level == levels[5]) {
       level_label <- "level4"
       long_geo <- unique_geo_long$long_geo[1]
-      long_geo_split <- strsplit(long_geo, "_")[[1]]
+      long_geo_split <- strsplit(long_geo, "\x1f", fixed = TRUE)[[1]]
       long_geo_country <- stringr::str_to_title(long_geo_split[1])
       long_geo_province <- stringr::str_to_title(long_geo_split[2])
       long_geo_district <- stringr::str_to_title(long_geo_split[3])
@@ -1481,6 +1723,24 @@ handle_user_interaction <- function(input_data, levels, level,
     } else if (user_choice == "m") { # Enter name manually
       manual_name <- readline(prompt = "Enter the name manually: ")
       replace_int <- .normalise_geoname(manual_name)
+      # a name the lookup doesn't have here leaves these rows unmatched, so
+      # they would be asked about again (under the new name) on every run
+      lookup_names_here <- .geoname_match_key(unique(
+        unique_geo_long$matched_names
+      ))
+      if (manual_name != "" &&
+        !(.geoname_match_key(replace_int) %in% lookup_names_here)) {
+        cli::cli_alert_warning(paste0(
+          "{.val {replace_int}} isn't in the lookup here, so these rows will ",
+          "stay unmatched and you'll be asked about {.val {replace_int}} ",
+          "on every run."
+        ))
+        use_anyway <- tolower(trimws(readline("Use it anyway? [y/n]: ")))
+        if (use_anyway != "y") {
+          cli::cli_alert_info("Not used. Choose again.")
+          next
+        }
+      }
       merge_ok <- if (manual_name != "") {
         confirm_merge(context, name_to_clean, replace_int)
       } else {
@@ -1496,11 +1756,11 @@ handle_user_interaction <- function(input_data, levels, level,
           name_to_match = name_to_clean,
           replacement = replace_int,
           longname_to_match = ifelse(
-            level != levels[1], paste0(long_geo, "_", name_to_clean),
+            level != levels[1], paste0(long_geo, "\x1f", name_to_clean),
             name_to_clean
           ),
           longname_corrected = ifelse(
-            level != levels[1], paste0(long_geo, "_", replace_int), long_geo
+            level != levels[1], paste0(long_geo, "\x1f", replace_int), long_geo
           ),
           created_time = format(Sys.time(), tz = "UTC", usetz = TRUE),
           reviewed = if (isTRUE(merge_ok)) "yes" else NA_character_
@@ -1525,11 +1785,11 @@ handle_user_interaction <- function(input_data, levels, level,
           name_to_match = name_to_clean,
           replacement = replace_int,
           longname_to_match = ifelse(
-            level != levels[1], paste0(long_geo, "_", name_to_clean),
+            level != levels[1], paste0(long_geo, "\x1f", name_to_clean),
             name_to_clean
           ),
           longname_corrected = ifelse(
-            level != levels[1], paste0(long_geo, "_", replace_int), long_geo
+            level != levels[1], paste0(long_geo, "\x1f", replace_int), long_geo
           ),
           created_time = format(Sys.time(), tz = "UTC", usetz = TRUE),
           reviewed = if (isTRUE(merge_ok)) "yes" else NA_character_
@@ -1617,28 +1877,18 @@ handle_user_interaction <- function(input_data, levels, level,
 #' @noRd
 construct_geo_names <- function(data, level0, level1, level2,
                                 level3 = NULL, level4 = NULL) {
-  data |>
-    dplyr::rowwise() |>
-    dplyr::mutate(long_geo = {
-      non_null_adms <- NULL
-      if (!is.null(level0) && !is.na(.data[[level0]])) {
-        non_null_adms <- c(non_null_adms, .data[[level0]])
-      }
-      if (!is.null(level1) && !is.na(.data[[level1]])) {
-        non_null_adms <- c(non_null_adms, .data[[level1]])
-      }
-      if (!is.null(level2) && !is.na(.data[[level2]])) {
-        non_null_adms <- c(non_null_adms, .data[[level2]])
-      }
-      if (!is.null(level3) && !is.na(.data[[level3]])) {
-        non_null_adms <- c(non_null_adms, .data[[level3]])
-      }
-      if (!is.null(level4) && !is.na(.data[[level4]])) {
-        non_null_adms <- c(non_null_adms, .data[[level4]])
-      }
-      paste(non_null_adms, collapse = "_")
-    }) |>
-    dplyr::ungroup()
+  cols <- c(level0, level1, level2, level3, level4)
+  parts <- lapply(cols, function(col) as.character(data[[col]]))
+  # names are joined with \x1f, which can't appear in a place name (unlike
+  # "_"); a row with a missing level gets no long name, so it can't be
+  # mistaken for a shorter path in the lookup
+  long_geo <- do.call(paste, c(parts, sep = "\x1f"))
+  if (length(parts) > 0) {
+    missing <- Reduce(`|`, lapply(parts, is.na))
+    long_geo[missing] <- NA_character_
+  }
+  data$long_geo <- long_geo
+  data
 }
 
 #' Apply Case Mapping to Data Frame
@@ -1850,7 +2100,12 @@ export_unmatched_data <- function(target_todo, unmatched_export_path,
 #'        session. A correction is tied to where the name was found (e.g.
 #'        MUNICIPAL AREA COUNCIL -> AMAC within FCT), so the same name can be
 #'        corrected differently under different parents; if a name is
-#'        corrected again, the newest correction wins. If NULL (the default),
+#'        corrected again, the newest correction wins. Saved corrections are
+#'        matched ignoring spacing and punctuation (FCT, ABUJA also covers
+#'        FCT,ABUJA and FCT - ABUJA), and also apply when the call has one level
+#'        more or less (e.g. with or without a country column). A correction is
+#'        not used where the original name is itself in `lookup_df`
+#'        (e.g. after the lookup was updated). If NULL (the default),
 #'        a per-user cache is used: `getOption("poliprep.geoname_cache")` if
 #'        set, otherwise `geoname_cache.rds` in
 #'        `tools::R_user_dir("poliprep", "data")`. Set the option to a shared
@@ -1905,6 +2160,9 @@ export_unmatched_data <- function(target_todo, unmatched_export_path,
 #'    with tidy spacing, for consistent matching.
 #' 2. Applies every correction saved in the cache (see `cache_path`), so
 #'    names corrected in earlier sessions are fixed before matching.
+#'    Names that differ from `lookup_df` only in spacing or punctuation
+#'    (FCT,ABUJA vs FCT, ABUJA) then take the lookup's spelling, unless two
+#'    lookup names fit.
 #' 3. Matches administrative names between `target_df` and `lookup_df` using
 #'    string distance algorithms, running in parallel. Results are ranked
 #'    by closeness.
@@ -2226,6 +2484,7 @@ prep_geonames <- function(
   # choices from a menu session that was stopped part-way go into the cache
   # first, so they are applied now and not asked again
   session_path <- .geoname_session_path(cache_path)
+  unsaved_rows <- NULL
   if (file.exists(session_path)) {
     recovered <- tryCatch(readRDS(session_path), error = function(e) NULL)
     if (!is.null(recovered) && NROW(recovered) > 0) {
@@ -2239,9 +2498,13 @@ prep_geonames <- function(
           ))
         },
         error = function(e) {
-          cli::cli_alert_danger(
-            "Could not recover {.file {session_path}}: {conditionMessage(e)}"
-          )
+          # couldn't write the cache: still use these choices in this run,
+          # and keep the file so the next run tries again
+          unsaved_rows <<- recovered
+          cli::cli_alert_danger(c(
+            "Could not add {.file {session_path}} to the cache: ",
+            "{conditionMessage(e)}. Its corrections are still used in this run."
+          ))
         }
       )
     } else {
@@ -2250,6 +2513,11 @@ prep_geonames <- function(
   }
 
   saved_cache_df <- .read_geoname_cache(cache_path)
+  if (!is.null(unsaved_rows)) {
+    saved_cache_df <- .dedupe_geoname_cache(
+      dplyr::bind_rows(saved_cache_df, .standardise_geoname_cache(unsaved_rows))
+    )
+  }
 
   # caches saved by earlier versions without a cache_path landed in the
   # working directory; fold them in so those corrections aren't lost
@@ -2274,13 +2542,36 @@ prep_geonames <- function(
   }
 
   if (nrow(saved_cache_df) > 0) {
-    applied <- .apply_geoname_cache(target_df, saved_cache_df, levels)
+    applied <- .apply_geoname_cache(target_df, saved_cache_df, levels, lookup_df)
     target_df <- applied$data
     cli::cli_alert_success(
       paste0(
         "Applied {applied$names} saved correction{?s} to {applied$rows} ",
         "row{?s} from {.file {cache_path}}."
       )
+    )
+    if (applied$layout > 0) {
+      cli::cli_alert_info(paste0(
+        "{applied$layout} of {?it/them} came from a run with a different ",
+        "set of levels (e.g. with or without a country column)."
+      ))
+    }
+    .report_geoname_list(
+      applied$now_valid,
+      paste0(
+        "{n} saved correction{?s} not used, because the name is already ",
+        "in the lookup:"
+      ),
+      type = "info"
+    )
+    .report_geoname_list(
+      applied$not_in_lookup,
+      paste0(
+        "{n} saved correction{?s} lead{?s/} to a name that isn't in the ",
+        "lookup, so {?it is/they are} asked about again. Choose a name ",
+        "from the list this time:"
+      ),
+      type = "warning"
     )
   } else {
     cli::cli_alert_info(
@@ -2289,6 +2580,17 @@ prep_geonames <- function(
         "{.file {cache_path}} and applied automatically next time."
       )
     )
+  }
+
+  # names that differ from the lookup only in spacing or punctuation
+  # ("FCT,ABUJA" vs "FCT, ABUJA") take the lookup's spelling without asking
+  loose <- .match_geonames_loosely(target_df, lookup_df, levels)
+  target_df <- loose$data
+  if (loose$rows > 0) {
+    cli::cli_alert_success(paste0(
+      "Used the lookup's spelling for {loose$rows} row{?s} that differed ",
+      "only in spacing or punctuation."
+    ))
   }
 
   # Step 2: Filter out for those where there is a match ------------------------
@@ -2361,18 +2663,15 @@ prep_geonames <- function(
     level4
   )
 
+  lookup_long_geo <- unique(stats::na.omit(lookup_df[["long_geo"]]))
+
   # filter to matched rows
   target_done <- target_df |>
-    dplyr::filter(
-      (long_geo %in%
-        unique(lookup_df[["long_geo"]]))
-    )
+    dplyr::filter(!is.na(long_geo) & long_geo %in% lookup_long_geo)
 
   # reduce down to only unmatched rows
   target_todo <- target_df |>
-    dplyr::filter(
-      !(long_geo %in% unique(lookup_df[["long_geo"]]))
-    )
+    dplyr::filter(is.na(long_geo) | !(long_geo %in% lookup_long_geo))
 
   calculate_match_stats(
     target_df,
@@ -2452,11 +2751,12 @@ prep_geonames <- function(
       dplyr::mutate(long_geo = context)
   }
 
-  # "NIGERIA_FCT" style key of all levels above `upto`
+  # key of all levels above this one, e.g. "NIGERIA\x1fFCT" (\x1f can't
+  # appear in a place name, unlike "_")
   parent_key <- function(df, parent_levels) {
     do.call(
       paste,
-      c(lapply(parent_levels, function(l) df[[l]]), sep = "_")
+      c(lapply(parent_levels, function(l) df[[l]]), sep = "\x1f")
     )
   }
 
@@ -2571,7 +2871,7 @@ prep_geonames <- function(
   }
 
   if (length(skipped_parents) > 0) {
-    skipped_parents <- unique(skipped_parents)
+    skipped_parents <- gsub("\x1f", " / ", unique(skipped_parents), fixed = TRUE)
     cli::cli_alert_warning(
       paste0(
         "{length(skipped_parents)} group{?s} skipped because the higher ",
@@ -2641,7 +2941,7 @@ prep_geonames <- function(
     # Tag the target_todo with source names
     target_todo_tagged <- target_todo <- target_todo |>
       # filter out the matched
-      dplyr::filter(!(long_geo %in% unique(lookup_df$long_geo))) |>
+      dplyr::filter(is.na(long_geo) | !(long_geo %in% lookup_long_geo)) |>
       dplyr::mutate(
         target_data = target_df_name,
         lookup_data = lookup_df_name

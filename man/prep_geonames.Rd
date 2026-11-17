@@ -47,7 +47,12 @@ new corrections are added to it at the end of an interactive
 session. A correction is tied to where the name was found (e.g.
 MUNICIPAL AREA COUNCIL -> AMAC within FCT), so the same name can be
 corrected differently under different parents; if a name is
-corrected again, the newest correction wins. If NULL (the default),
+corrected again, the newest correction wins. Saved corrections are
+matched ignoring spacing and punctuation (FCT, ABUJA also covers
+FCT,ABUJA and FCT - ABUJA), and also apply when the call has one level
+more or less (e.g. with or without a country column). A correction is
+not used where the original name is itself in \code{lookup_df}
+(e.g. after the lookup was updated). If NULL (the default),
 a per-user cache is used: \code{getOption("poliprep.geoname_cache")} if
 set, otherwise \code{geoname_cache.rds} in
 \code{tools::R_user_dir("poliprep", "data")}. Set the option to a shared
@@ -125,6 +130,9 @@ The function performs the following steps:
 with tidy spacing, for consistent matching.
 \item Applies every correction saved in the cache (see \code{cache_path}), so
 names corrected in earlier sessions are fixed before matching.
+Names that differ from \code{lookup_df} only in spacing or punctuation
+(FCT,ABUJA vs FCT, ABUJA) then take the lookup's spelling, unless two
+lookup names fit.
 \item Matches administrative names between \code{target_df} and \code{lookup_df} using
 string distance algorithms, running in parallel. Results are ranked
 by closeness.
