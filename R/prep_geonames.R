@@ -9,21 +9,26 @@
 .clear_console <- function() {
   if (!interactive()) return(invisible(NULL))
 
-  # Method 1: Form feed (works in RStudio)
+  # RStudio, Positron and VS Code clear their console on a form feed (Ctrl+L)
+  # and don't run a shell, so stop there
   cat("\014")
+  in_ide <- identical(Sys.getenv("RSTUDIO"), "1") ||
+    nzchar(Sys.getenv("POSITRON")) ||
+    identical(Sys.getenv("TERM_PROGRAM"), "vscode")
+  if (in_ide) return(invisible(NULL))
 
-  # Method 2: ANSI escape codes (works in most terminals including VSCode)
+  # plain terminals: ANSI escape codes, then the system's clear command.
+  # On Windows "cls" is built into cmd.exe, not a program system() can find,
+  # so it has to go through cmd. Failures are ignored: clearing is cosmetic.
   cat("\033[2J\033[H")
-
-  # Method 3: System call for Unix/Mac terminals
-  if (.Platform$OS.type == "unix") {
-    system("clear", ignore.stdout = TRUE, ignore.stderr = TRUE)
-  }
-
-  # Method 4: System call for Windows
-  if (.Platform$OS.type == "windows") {
-    system("cls", ignore.stdout = TRUE, ignore.stderr = TRUE)
-  }
+  suppressWarnings(try(
+    if (.Platform$OS.type == "windows") {
+      system2("cmd", c("/c", "cls"), stdout = FALSE, stderr = FALSE)
+    } else {
+      system2("clear", stdout = FALSE, stderr = FALSE)
+    },
+    silent = TRUE
+  ))
 
   invisible(NULL)
 }

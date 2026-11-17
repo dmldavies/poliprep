@@ -2455,3 +2455,23 @@ testthat::test_that("a reviewed merge stays reviewed for punctuation variants", 
     nrow(.find_geoname_merges(before, after, levels, reviewed)), 0
   )
 })
+
+testthat::test_that("clearing the console in an IDE never calls the shell", {
+  mockery::stub(.clear_console, "interactive", function() TRUE)
+  shell_calls <- 0
+  mockery::stub(.clear_console, "system2", function(...) shell_calls <<- shell_calls + 1)
+  withr::with_envvar(c(RSTUDIO = "1"), {
+    testthat::expect_no_warning(utils::capture.output(.clear_console()))
+  })
+  testthat::expect_equal(shell_calls, 0)
+})
+
+testthat::test_that("a failing clear command gives no warning", {
+  mockery::stub(.clear_console, "interactive", function() TRUE)
+  mockery::stub(.clear_console, "system2", function(...) {
+    warning("'cls' not found")
+  })
+  withr::with_envvar(c(RSTUDIO = "", POSITRON = "", TERM_PROGRAM = ""), {
+    testthat::expect_no_warning(utils::capture.output(.clear_console()))
+  })
+})
