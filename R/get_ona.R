@@ -48,21 +48,17 @@ check_status_api <- function(response) {
 #' forms/data.
 #'
 #' @param base_url The base URL for the ONA API; defaults to
-#'            'https://api.whonghub.org'.
+#'            'https://api.padacor.org'.
 #' @param api_token API token for authentication.
 #'
 #' @return Data frame of the API endpoint data.
 #'
 #' @export
 available_ona_forms <- function(
-    base_url = "https://api.whonghub.org", api_token) {
-  # check base url validity
-  base_url_pattern <- "^(https?://[^/]+).*"
-  if (grepl(base_url_pattern, base_url)) {
-    base_url <- sub(base_url_pattern, "\\1", base_url)
-  } else {
-    stop(paste("Error: ", base_url, " is not a valid base url"))
-  }
+    base_url = "https://api.padacor.org", api_token) {
+  # check base url validity (and fall back to api.whonghub.org while
+  # api.padacor.org isn't live yet)
+  base_url <- .resolve_ona_base_url(base_url, api_token)
 
   # set up URL
   api_url <- paste0(base_url, "/api/v1/data")
@@ -277,7 +273,7 @@ process_logical_filters <- function(filters) {
 #' returns an error message indicating the failure reason.
 #'
 #' @param base_url A string specifying the URL for the ONA API.
-#'                Default is "https://api.whonghub.org"
+#'                Default is "https://api.padacor.org"
 #' @param form_id A string or numeric value specifying the dataset ID.
 #'                Can be found in the URL of the form on ONA.
 #' @param api_token A string specifying the API token for authentication
@@ -318,15 +314,16 @@ process_logical_filters <- function(filters) {
 #' }
 #'
 #' @seealso \url{https://api.ona.io/api/v1/data/} for ONA API documentation
-get_ona_form <- function(base_url = "https://api.whonghub.org",
+get_ona_form <- function(base_url = "https://api.padacor.org",
                          form_id,
                          api_token,
                          selected_columns = NULL,
                          logical_filters = NULL,
                          comparison_filters = NULL,
                          validate = TRUE) {
-  # Check base URL validity
-  base_url <- validate_base_url(base_url)
+  # Check base URL validity (and fall back to api.whonghub.org while
+  # api.padacor.org isn't live yet)
+  base_url <- .resolve_ona_base_url(base_url, api_token)
 
   # Set up API URL
   api_url <- paste0(base_url, "/api/v1/data/", form_id)
@@ -660,6 +657,67 @@ validate_base_url <- function(base_url) {
   sub(base_url_pattern, "\\1", base_url)
 }
 
+# ONA server addresses ---------------------------------------------------------
+# The WHO-AFRO ONA server is moving from api.whonghub.org to api.padacor.org.
+# Until the new address answers, requests for it fall back to the old one.
+.ona_url_new <- "https://api.padacor.org"
+.ona_url_old <- "https://api.whonghub.org"
+.ona_url_state <- new.env(parent = emptyenv())
+
+#' Pick the ONA server to use
+#'
+#' Returns `base_url` (normalised) unchanged, except when it is
+#' "https://api.padacor.org": then the server is asked once per R session
+#' whether it is live (GET /api/v1/user with the token). It counts as live
+#' when it answers from api.padacor.org itself with JSON (200, or 401/403 for
+#' a token it doesn't accept). Otherwise, e.g. while api.padacor.org still
+#' shows a "Page has been disabled" page that redirects to whonghub.org, a
+#' warning is shown once and "https://api.whonghub.org" is used instead.
+#'
+#' @param base_url Base URL given by the user (or the default).
+#' @param api_token ONA API token.
+#' @return The base URL to use.
+#' @keywords internal
+#' @noRd
+.resolve_ona_base_url <- function(base_url, api_token) {
+  base_url <- validate_base_url(base_url)
+  if (!identical(tolower(base_url), .ona_url_new)) {
+    return(base_url)
+  }
+  if (!is.null(.ona_url_state$resolved)) {
+    return(.ona_url_state$resolved)
+  }
+
+  live <- tryCatch(
+    {
+      resp <- httr::GET(
+        paste0(.ona_url_new, "/api/v1/user"),
+        config = httr::add_headers(Authorization = paste("Token", api_token)),
+        httr::timeout(15)
+      )
+      final_host <- httr::parse_url(resp$url)$hostname
+      content_type <- httr::headers(resp)[["content-type"]]
+      if (is.null(content_type)) content_type <- ""
+      identical(tolower(final_host), "api.padacor.org") &&
+        httr::status_code(resp) %in% c(200, 401, 403) &&
+        grepl("json", content_type, ignore.case = TRUE)
+    },
+    error = function(e) FALSE
+  )
+
+  resolved <- if (isTRUE(live)) {
+    .ona_url_new
+  } else {
+    cli::cli_alert_warning(paste0(
+      "{.url ", .ona_url_new, "} isn't answering as an ONA server yet; ",
+      "using {.url ", .ona_url_old, "} for this R session."
+    ))
+    .ona_url_old
+  }
+  .ona_url_state$resolved <- resolved
+  resolved
+}
+
 #' Retrieve Paginated Data from API
 #'
 #' Fetches data from a specified API URL in a paginated manner using the
@@ -813,7 +871,7 @@ praise_emoji <- function() {
 #'
 #' @inheritParams get_ona_data
 #' @keywords internal
-get_multi_ona_data <- function(base_url = "https://api.whonghub.org",
+get_multi_ona_data <- function(base_url = "https://api.padacor.org",
                                form_ids,
                                api_token,
                                selected_columns = NULL,
@@ -844,7 +902,7 @@ get_multi_ona_data <- function(base_url = "https://api.whonghub.org",
 #' the data in a structured format if the request is successful.
 #'
 #' @param base_url The base URL for the ONA API; defaults to
-#'            'https://api.whonghub.org'.
+#'            'https://api.padacor.org'.
 #' @param form_ids A vector containing form id number to identify each form.
 #' @param api_token A string specifying the API token for ONA.
 #' @param selected_columns Selected columns to download. Default is NULL.
@@ -861,11 +919,15 @@ get_multi_ona_data <- function(base_url = "https://api.whonghub.org",
 #' # api_token <- "your_api_token_here"
 #' @importFrom foreach %dopar%
 #' @export
-get_ona_data <- function(base_url = "https://api.whonghub.org",
+get_ona_data <- function(base_url = "https://api.padacor.org",
                          form_ids, api_token,
                          selected_columns = NULL,
                          logical_filters = NULL,
                          comparison_filters = NULL) {
+
+  # Check base URL validity (and fall back to api.whonghub.org while
+  # api.padacor.org isn't live yet)
+  base_url <- .resolve_ona_base_url(base_url, api_token)
 
   # Check if the form IDs are available for download ---------------------------
   resp_data <- available_ona_forms(
@@ -1069,7 +1131,7 @@ call_urls <- function(urls, api_token) {
 #' specified, and saves the updated dataset.
 #'
 #' @param base_url The base URL for the API calls, defaults to
-#'        "https://api.whonghub.org".
+#'        "https://api.padacor.org".
 #' @param form_ids A vector of form IDs to download data for.
 #' @param api_token The API token used for authentication with the API.
 #' @param log_results Boolean flag to indicate whether to log results of the
@@ -1095,7 +1157,7 @@ call_urls <- function(urls, api_token) {
 #' #       form_ids = c(123, 456), api_token = "your_api_token_here")
 #'
 #' @export
-get_updated_ona_data <- function(base_url = "https://api.whonghub.org",
+get_updated_ona_data <- function(base_url = "https://api.padacor.org",
                                  form_ids, api_token,
                                  log_results = TRUE, file_path = NULL,
                                  selected_columns = NULL,
@@ -1103,8 +1165,9 @@ get_updated_ona_data <- function(base_url = "https://api.whonghub.org",
                                  comparison_filters = NULL,
                                  data_file_name = "my_ona_data",
                                  return_results = FALSE) {
-  # check base url validity
-  base_url <- validate_base_url(base_url)
+  # check base url validity (and fall back to api.whonghub.org while
+  # api.padacor.org isn't live yet)
+  base_url <- .resolve_ona_base_url(base_url, api_token)
 
   if (is.null(file_path)) {
     # Prompt the user to enter the file path

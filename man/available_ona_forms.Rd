@@ -4,11 +4,11 @@
 \alias{available_ona_forms}
 \title{Fetch ONA API Data}
 \usage{
-available_ona_forms(base_url = "https://api.whonghub.org", api_token)
+available_ona_forms(base_url = "https://api.padacor.org", api_token)
 }
 \arguments{
 \item{base_url}{The base URL for the ONA API; defaults to
-'https://api.whonghub.org'.}
+'https://api.padacor.org'.}
 
 \item{api_token}{API token for authentication.}
 }

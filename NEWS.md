@@ -1,3 +1,15 @@
+# poliprep (development version)
+
+## ONA server address
+
+- The default `base_url` of `available_ona_forms()`, `get_ona_data()`,
+  `get_ona_form()`, `get_updated_ona_data()` and `get_multi_ona_data()` is
+  now `https://api.padacor.org` (was `https://api.whonghub.org`): the
+  WHO-AFRO ONA server is moving there.
+- Until api.padacor.org answers as an ONA server, these functions say so once
+  per R session and use `https://api.whonghub.org` instead. Any other
+  `base_url` you pass, including api.whonghub.org, is used as given.
+
 # poliprep 1.4.0
 
 ## prep_geonames(): saved corrections now apply automatically

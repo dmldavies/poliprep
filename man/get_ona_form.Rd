@@ -5,7 +5,7 @@
 \title{Get Form from ONA API}
 \usage{
 get_ona_form(
-  base_url = "https://api.whonghub.org",
+  base_url = "https://api.padacor.org",
   form_id,
   api_token,
   selected_columns = NULL,
@@ -16,7 +16,7 @@ get_ona_form(
 }
 \arguments{
 \item{base_url}{A string specifying the URL for the ONA API.
-Default is "https://api.whonghub.org"}
+Default is "https://api.padacor.org"}
 
 \item{form_id}{A string or numeric value specifying the dataset ID.
 Can be found in the URL of the form on ONA.}

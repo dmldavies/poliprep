@@ -5,7 +5,7 @@
 \title{Update ONA Data}
 \usage{
 get_updated_ona_data(
-  base_url = "https://api.whonghub.org",
+  base_url = "https://api.padacor.org",
   form_ids,
   api_token,
   log_results = TRUE,
@@ -19,7 +19,7 @@ get_updated_ona_data(
 }
 \arguments{
 \item{base_url}{The base URL for the API calls, defaults to
-"https://api.whonghub.org".}
+"https://api.padacor.org".}
 
 \item{form_ids}{A vector of form IDs to download data for.}
 

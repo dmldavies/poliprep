@@ -141,6 +141,8 @@ testthat::test_that("get_ona_form respects validate = FALSE", {
 
   mockery::stub(get_ona_form, "available_ona_forms", fake_available)
   mockery::stub(get_ona_form, "get_paginated_data", fake_paginated)
+  # no server check: this test is about validate only
+  mockery::stub(get_ona_form, ".resolve_ona_base_url", function(base_url, api_token) base_url)
 
   # validate = FALSE should NOT call available_ona_forms
   suppressMessages(
@@ -175,6 +177,7 @@ testthat::test_that("get_ona_data only validates form IDs once", {
 
   mockery::stub(get_ona_data, "available_ona_forms", fake_available)
   mockery::stub(get_ona_data, "get_ona_form", fake_form)
+  mockery::stub(get_ona_data, ".resolve_ona_base_url", function(base_url, api_token) base_url)
   # Stub the internal GPS helper since our fake data has no GPS columns
   mockery::stub(get_ona_data, ".parse_gps_columns", function(x) x)
 
@@ -214,4 +217,73 @@ testthat::test_that("get_ona_data forwards base_url to get_ona_form", {
   )
 
   testthat::expect_equal(captured_base_url, "https://staging.example.org")
+})
+
+# ONA server move: api.whonghub.org -> api.padacor.org -------------------------
+
+fake_ona_response <- function(url, status = 200L, type = "application/json") {
+  structure(
+    list(url = url, status_code = status, headers = list(`content-type` = type)),
+    class = "response"
+  )
+}
+
+testthat::test_that("the default ONA address is api.padacor.org", {
+  testthat::expect_equal(formals(get_ona_data)$base_url, "https://api.padacor.org")
+  testthat::expect_equal(formals(get_ona_form)$base_url, "https://api.padacor.org")
+  testthat::expect_equal(formals(available_ona_forms)$base_url, "https://api.padacor.org")
+  testthat::expect_equal(formals(get_updated_ona_data)$base_url, "https://api.padacor.org")
+})
+
+testthat::test_that("api.padacor.org is used once it answers as an ONA server", {
+  testthat::skip_if_not_installed("mockery")
+  .ona_url_state$resolved <- NULL
+  calls <- 0L
+  mockery::stub(.resolve_ona_base_url, "httr::GET", function(...) {
+    calls <<- calls + 1L
+    fake_ona_response("https://api.padacor.org/api/v1/user", 401L)
+  })
+  testthat::expect_equal(
+    .resolve_ona_base_url("https://api.padacor.org", "x"), "https://api.padacor.org"
+  )
+  # checked once per session
+  .resolve_ona_base_url("https://api.padacor.org/", "x")
+  testthat::expect_equal(calls, 1L)
+  .ona_url_state$resolved <- NULL
+})
+
+testthat::test_that("it falls back to api.whonghub.org while api.padacor.org isn't live", {
+  testthat::skip_if_not_installed("mockery")
+  .ona_url_state$resolved <- NULL
+  # the "Page has been disabled" page: HTML, redirected to whonghub.org
+  mockery::stub(.resolve_ona_base_url, "httr::GET", function(...) {
+    fake_ona_response("https://whonghub.org/", 200L, "text/html; charset=utf-8")
+  })
+  msgs <- testthat::capture_messages(
+    url <- .resolve_ona_base_url("https://api.padacor.org", "x")
+  )
+  testthat::expect_equal(url, "https://api.whonghub.org")
+  testthat::expect_true(any(grepl("isn't answering", msgs)))
+  .ona_url_state$resolved <- NULL
+
+  # no connection at all
+  mockery::stub(.resolve_ona_base_url, "httr::GET", function(...) stop("Could not resolve host"))
+  testthat::expect_equal(
+    suppressMessages(.resolve_ona_base_url("https://api.padacor.org", "x")),
+    "https://api.whonghub.org"
+  )
+  .ona_url_state$resolved <- NULL
+})
+
+testthat::test_that("other ONA addresses are never checked or changed", {
+  testthat::skip_if_not_installed("mockery")
+  .ona_url_state$resolved <- NULL
+  mockery::stub(.resolve_ona_base_url, "httr::GET", function(...) stop("should not be called"))
+  testthat::expect_equal(
+    .resolve_ona_base_url("https://api.whonghub.org/api/v1", "x"), "https://api.whonghub.org"
+  )
+  testthat::expect_equal(
+    .resolve_ona_base_url("https://staging.example.org", "x"), "https://staging.example.org"
+  )
+  testthat::expect_error(.resolve_ona_base_url("not a url", "x"), "not a valid base URL")
 })

@@ -5,7 +5,7 @@
 \title{Get Data from ONA for Multiple Forms (Deprecated)}
 \usage{
 get_multi_ona_data(
-  base_url = "https://api.whonghub.org",
+  base_url = "https://api.padacor.org",
   form_ids,
   api_token,
   selected_columns = NULL,
@@ -15,7 +15,7 @@ get_multi_ona_data(
 }
 \arguments{
 \item{base_url}{The base URL for the ONA API; defaults to
-'https://api.whonghub.org'.}
+'https://api.padacor.org'.}
 
 \item{form_ids}{A vector containing form id number to identify each form.}
 

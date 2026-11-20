@@ -109,9 +109,11 @@ available_froms <- available_ona_forms(
 
 Once you have a working API token and the form IDs of interest, you can seamlessly retrieve data from a specified form on the ONA API using the `get_ona_data` function.
 
+The ONA server is moving from `https://api.whonghub.org` to `https://api.padacor.org`, which is now the default `base_url`. Until the new address answers, poliprep says so once per R session and uses `https://api.whonghub.org` instead, so your code doesn't need to change during the move.
+
 ```r
 data_ona <- get_ona_data(
-               base_url = "https://api.whonghub.org", form_id = 7178,
+               base_url = "https://api.padacor.org", form_id = 7178,
                api_token = Sys.getenv("MY_ONA_TOKEN"))
 ```
 
@@ -119,7 +121,7 @@ The function also allows you to download selected columns using the `selected_co
 
 ```r
 data_ona <- get_ona_data(
-              base_url = "https://api.whonghub.org", form_ids = 7178,
+              base_url = "https://api.padacor.org", form_ids = 7178,
               api_token = Sys.getenv("MY_ONA_TOKEN"),
               selected_columns = c("states", "endtime", "today", "_duration")
               )
@@ -129,7 +131,7 @@ You can also filter your dataset before downloading. There are two parameters to
 
 ```r
 data_ona <- get_ona_data(
-              base_url = "https://api.whonghub.org", form_ids = 7178,
+              base_url = "https://api.padacor.org", form_ids = 7178,
               api_token = Sys.getenv("MY_ONA_TOKEN"),
               selected_columns = c("states", "endtime", "today", "_duration"),
               logical_filters = list(states = c("BORNO", "KANO")),
